@@ -746,6 +746,82 @@ class TestPollSandboxEvents:
             call.args[0].cmd for call in transcript.return_value._event.call_args_list
         ] == ["visible"]
 
+    async def test_no_events_is_restored_when_the_block_raises(self) -> None:
+        sandbox = _mock_sandbox()
+        sandbox.exec.return_value = ExecResult(
+            success=True, returncode=0, stdout="", stderr=""
+        )
+        proxy = SandboxEnvironmentProxy(sandbox)
+
+        with patch("inspect_ai.log._transcript.transcript") as transcript:
+            with pytest.raises(RuntimeError, match="failed"):
+                with proxy.no_events():
+                    await proxy.exec(["suppressed"])
+                    raise RuntimeError("failed")
+            await proxy.exec(["visible"])
+
+        assert [
+            call.args[0].cmd for call in transcript.return_value._event.call_args_list
+        ] == ["visible"]
+
+    async def test_cancelled_poll_restores_events(self) -> None:
+        """Cancelling a poll mid-request leaves this task's later events logged."""
+        sandbox = _mock_sandbox()
+        sandbox.default_polling_interval.return_value = 5
+        scope = anyio.CancelScope()
+
+        async def fake_exec(cmd: list[str], **kwargs: Any) -> ExecResult[str]:
+            method = (
+                None if cmd == ["visible"] else json.loads(kwargs["input"])["method"]
+            )
+            if method == "exec_remote_poll":
+                scope.cancel()
+                await anyio.sleep_forever()
+            response = {
+                None: "",
+                "exec_remote_start": _start_response(),
+                "exec_remote_kill": _kill_response(),
+            }[method]
+            return ExecResult(success=True, returncode=0, stdout=response, stderr="")
+
+        sandbox.exec = AsyncMock(side_effect=fake_exec)
+        proxy = SandboxEnvironmentProxy(sandbox)
+
+        with patch("inspect_ai.log._transcript.transcript") as transcript:
+            with scope:
+                await exec_remote_awaitable(proxy, ["cmd"], 5)
+            await proxy.exec(["visible"])
+
+        assert scope.cancelled_caught
+        events = [
+            call.args[0] for call in transcript.return_value._event.call_args_list
+        ]
+        # the start, the kill sent on cancellation, and the later exec
+        assert [json.loads(event.input)["method"] for event in events[:2]] == [
+            "exec_remote_start",
+            "exec_remote_kill",
+        ]
+        assert [event.cmd for event in events[2:]] == ["visible"]
+
+    async def test_no_events_hides_only_its_own_sandbox(self) -> None:
+        sandbox = _mock_sandbox()
+        sandbox.exec.return_value = ExecResult(
+            success=True, returncode=0, stdout="", stderr=""
+        )
+        quiet, other = (
+            SandboxEnvironmentProxy(sandbox),
+            SandboxEnvironmentProxy(sandbox),
+        )
+
+        with patch("inspect_ai.log._transcript.transcript") as transcript:
+            with quiet.no_events():
+                await quiet.exec(["suppressed"])
+                await other.exec(["visible"])
+
+        assert [
+            call.args[0].cmd for call in transcript.return_value._event.call_args_list
+        ] == ["visible"]
+
 
 # ============================================================================
 # Timeout

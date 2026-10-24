@@ -32,11 +32,20 @@ class SandboxTimeoutError(TimeoutError):
         """Partial command output captured before the timeout, if available."""
 
 
+_events_off: ContextVar[frozenset["SandboxEnvironmentProxy"]] = ContextVar(
+    "sandbox_events_off", default=frozenset()
+)
+"""Proxies whose events the current task does not log (see `no_events`)."""
+
+
 class SandboxEnvironmentProxy(SandboxEnvironment):
     def __init__(self, sandbox: SandboxEnvironment) -> None:
         super().__init__()
         self._sandbox = sandbox
-        self._events: ContextVar[bool] = ContextVar("sandbox_events", default=True)
+
+    @property
+    def _events(self) -> bool:
+        return self not in _events_off.get()
 
     @override
     async def exec(
@@ -97,7 +106,7 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
         if timeout_retry is not True:
             options["timeout_retry"] = timeout_retry
 
-        if self._events.get():
+        if self._events:
             transcript()._event(
                 SandboxEvent(
                     timestamp=timestamp,
@@ -154,7 +163,7 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
             raise SandboxTimeoutError(str(ex)) from ex
 
         # yield event
-        if self._events.get():
+        if self._events:
             transcript()._event(
                 SandboxEvent(
                     timestamp=timestamp,
@@ -188,7 +197,7 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
             raise SandboxTimeoutError(str(ex)) from ex
 
         # yield event
-        if self._events.get():
+        if self._events:
             transcript()._event(
                 SandboxEvent(
                     timestamp=timestamp,
@@ -222,13 +231,13 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
 
     @contextlib.contextmanager
     def no_events(self) -> Iterator[None]:
-        """Log no sandbox events for this task (and tasks it starts) in the block."""
-        token = self._events.set(False)
+        """Log no events of this sandbox from this task (and tasks it starts) in the block."""
+        token = _events_off.set(_events_off.get() | {self})
         try:
             with untracked_sandbox_execs():
                 yield
         finally:
-            self._events.reset(token)
+            _events_off.reset(token)
 
     @classmethod
     async def sample_cleanup(
