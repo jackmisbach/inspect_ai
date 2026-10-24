@@ -35,6 +35,8 @@ class PollParams(BaseModel):
 MAX_WAIT_SECONDS = 5.0
 
 # Longer waits are clamped, not rejected, so hosts need not know the server's limit.
+# The wait RPCs ignore unknown fields, so a newer host can add optional ones; a
+# field an older server must not ignore needs its own capability check.
 WaitSeconds = Annotated[
     float,
     Field(ge=0, allow_inf_nan=False),
@@ -47,6 +49,7 @@ class StartWaitParams(SubmitParams):
 
     request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     wait_seconds: WaitSeconds
+    model_config = {"extra": "ignore"}
 
 
 class PollWaitParams(BaseModel):
@@ -55,7 +58,7 @@ class PollWaitParams(BaseModel):
     request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     ack_seq: int = Field(ge=0)
     wait_seconds: WaitSeconds
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
 
 class KillWaitParams(BaseModel):
@@ -63,7 +66,7 @@ class KillWaitParams(BaseModel):
 
     request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     ack_seq: int = Field(ge=0)
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
 
 class KillParams(BaseModel):

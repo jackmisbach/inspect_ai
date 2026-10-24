@@ -20,6 +20,7 @@ from inspect_sandbox_tools._remote_tools._exec_remote._wait_controller import (
     WaitController,
 )
 from inspect_sandbox_tools._remote_tools._exec_remote.tool_types import (
+    KillWaitParams,
     PollWaitParams,
     StartWaitParams,
     WaitResult,
@@ -543,3 +544,24 @@ def test_invalid_wait_duration_is_rejected(value: float) -> None:
         StartWaitParams(request_id=uuid4().hex, command="true", wait_seconds=value)
     with pytest.raises(ValidationError):
         PollWaitParams(request_id=uuid4().hex, ack_seq=0, wait_seconds=value)
+
+
+def test_wait_params_ignore_fields_from_a_newer_host() -> None:
+    request_id = uuid4().hex
+    newer = {"acks": [uuid4().hex], "added_later": {"x": 1}}
+
+    start = StartWaitParams.model_validate(
+        {"request_id": request_id, "command": "true", "wait_seconds": 1, **newer}
+    )
+    poll = PollWaitParams.model_validate(
+        {"request_id": request_id, "ack_seq": 2, "wait_seconds": 1, **newer}
+    )
+    kill = KillWaitParams.model_validate(
+        {"request_id": request_id, "ack_seq": 2, **newer}
+    )
+
+    assert (start.request_id, start.command) == (request_id, "true")
+    assert (poll.ack_seq, kill.ack_seq) == (2, 2)
+    assert (
+        "added_later" not in start.model_dump() | poll.model_dump() | kill.model_dump()
+    )
