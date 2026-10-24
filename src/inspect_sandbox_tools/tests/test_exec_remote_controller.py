@@ -194,6 +194,42 @@ async def test_poll_completes_while_a_child_floods_the_pipe(
     assert result.exit_code == 3
 
 
+async def test_poll_cancelled_while_readers_settle_keeps_the_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A poll cancelled while waiting for the readers leaves the job to the next poll."""
+    settling = anyio.Event()
+    settle_readers = Job._settle_readers
+
+    async def signal_then_settle(job: Job) -> None:
+        settling.set()
+        await settle_readers(job)
+
+    monkeypatch.setattr(Job, "_settle_readers", signal_then_settle)
+    controller = Controller()
+    pid = await controller.submit("(sleep 0.5; printf late) & printf early")
+    job = controller._jobs[pid]
+    try:
+        await job._process.wait()
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(controller.poll, pid, 0)
+            await settling.wait()
+            tasks.cancel_scope.cancel()
+
+        # the controller still owns the job, and its readers were not stopped
+        assert controller._jobs[pid] is job
+        assert not job._stdout_task.done()
+        with anyio.fail_after(5):
+            result, stdout = await _poll_until_done(controller, pid)
+    finally:
+        await controller.shutdown()
+
+    assert result.state == "completed"
+    assert stdout == "earlylate"
+    assert pid not in controller._jobs
+    assert job._stdout_task.done() and job._stderr_task.done()
+
+
 async def _stop_job(job: Job) -> None:
     if job._process.returncode is None:
         job._process.kill()
