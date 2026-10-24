@@ -108,6 +108,7 @@ def _mock_sandbox() -> AsyncMock:
     sandbox = AsyncMock()
     sandbox._tools_default_user = None
     sandbox._exec_remote_wait_supported = False
+    sandbox._exec_remote_acks = ()
     sandbox.no_events = _no_events_context
     sandbox.no_event_output = _no_events_context
     return sandbox
@@ -1056,6 +1057,48 @@ class TestAwaitableWaitProtocol:
             "exec_remote_start_wait",
         ]
         assert sandbox.requests[0][1] == sandbox.requests[1][1]
+
+    async def test_terminal_replies_are_acknowledged_on_the_next_start(self) -> None:
+        sandbox = _make_scripted_sandbox([_wait_response(stdout="first")])
+        sandbox._exec_remote_wait_supported = None
+
+        await exec_remote_awaitable(sandbox, ["one"], 5, _WAIT)
+        await exec_remote_awaitable(sandbox, ["two"], 5, _WAIT)
+
+        first, second = (params for _, params in sandbox.requests)
+        assert first["acks"] == []
+        assert second["acks"] == [first["request_id"]]
+        assert sandbox._exec_remote_acks == (second["request_id"],)
+
+    async def test_kill_replies_are_acknowledged_on_the_next_start(self) -> None:
+        sandbox = _mock_sandbox()
+        sandbox._exec_remote_wait_supported = None
+        requests: list[dict[str, Any]] = []
+
+        async def fake_exec(*args: Any, **kwargs: Any) -> ExecResult[str]:
+            request = json.loads(kwargs["input"])
+            requests.append(request)
+            if len(requests) == 1:
+                await anyio.sleep_forever()
+            if request["method"] == "exec_remote_kill_wait":
+                response = _kill_response(seq=1)
+            else:
+                response = _wait_response()
+            return ExecResult(success=True, returncode=0, stdout=response, stderr="")
+
+        sandbox.exec = AsyncMock(side_effect=fake_exec)
+        with pytest.raises(TimeoutError):
+            await exec_remote_awaitable(
+                sandbox,
+                ["one"],
+                5,
+                ExecRemoteAwaitableOptions(timeout=0.01, server_wait=True),
+            )
+        await exec_remote_awaitable(sandbox, ["two"], 5, _WAIT)
+
+        first, kill, second = (request["params"] for request in requests)
+        assert kill["request_id"] == first["request_id"]
+        assert second["acks"] == [first["request_id"]]
 
     async def test_old_server_fallback_is_cached(self) -> None:
         sandbox = _make_scripted_sandbox(
@@ -2043,20 +2086,17 @@ async def test_awaitable_returns_in_one_wait_trip(docker_sandbox) -> None:
 @skip_if_no_docker
 @pytest.mark.slow
 async def test_lost_start_reply_does_not_launch_twice(docker_sandbox) -> None:
-    """The resent start of a running command reports it instead of launching again."""
     methods, recording = _record_methods(fail_first=True)
     with recording:
         result = await exec_remote_awaitable(
             docker_sandbox,
-            ["sh", "-c", "echo x >> /tmp/launches; sleep 2; cat /tmp/launches"],
+            ["sh", "-c", "echo x >> /tmp/launches; cat /tmp/launches"],
             docker_sandbox.default_polling_interval(),
-            # holds each request for 1 s, so the first start returns while it runs
-            ExecRemoteAwaitableOptions(poll_timeout=4, server_wait=True),
+            _WAIT,
         )
     launches = await docker_sandbox.exec(["cat", "/tmp/launches"])
 
-    assert methods[:2] == ["exec_remote_start_wait", "exec_remote_start_wait"]
-    assert set(methods[2:]) <= {"exec_remote_poll_wait"}
+    assert methods == ["exec_remote_start_wait", "exec_remote_start_wait"]
     assert result.stdout == launches.stdout == "x\n"
 
 

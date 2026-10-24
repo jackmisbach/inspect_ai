@@ -152,7 +152,8 @@ class ExecRemoteCommonOptions:
     so recovery can run past this value by the 5-second pause plus one re-issued
     poll, including that poll's retries. While the command is running, a
     re-issued poll replays any output the lost response carried; if the command
-    ended during the stall, its exit status is lost and `RuntimeError` is raised.
+    ended during the stall, its exit status is lost and `RuntimeError` is raised
+    (with `server_wait`, the server keeps the final reply for a limited time).
     Only polls are re-issued, and none once `kill()` has been called, even if the
     kill request itself timed out; the error the last poll got is raised instead.
     A caller's `timeout` (awaitable mode) or cancellation still ends the wait at
@@ -205,13 +206,12 @@ class ExecRemoteAwaitableOptions(ExecRemoteCommonOptions):
     A start that fails without an answer from the server (a lost connection, or
     a timeout unless `poll_timeout_retry` is False) is resent once with the same
     request ID, within 60 seconds of the first attempt. The server then reports
-    the command it already launched while it runs, instead of launching it
-    again. Once the command has finished the server does not keep its result,
-    so the resent start fails with an error that says the result was lost and
-    how the command ended (for example its exit code). The server remembers
-    request IDs for an hour after the command finishes, but not across a
-    restart of the sandbox tools server. Servers without support are polled as
-    usual.
+    the command it already launched, or its final result while the server
+    keeps it, instead of launching it again. Once that result is no longer
+    kept, the resent start fails with an error that says the result was lost
+    and how the command ended (for example its exit code). It remembers request
+    IDs for an hour after their results are dropped, but not across a restart of
+    the sandbox tools server. Servers without support are polled as usual.
     """
 
 
@@ -306,7 +306,7 @@ WAIT_CONCURRENCY_ENV = "INSPECT_EXEC_REMOTE_WAIT_CONCURRENCY"
 
 START_RESEND_SECONDS = 60.0
 """A failed `server_wait` start is resent only this soon after it was first
-sent, well within the hour the server remembers request IDs."""
+sent, well within the 5 minutes the server keeps a completed reply."""
 
 POLL_TIMEOUT_RECOVERY_WAIT_SECONDS: float = 5.0
 """Pause before re-issuing a timed-out poll (see `poll_timeout_recovery`)."""
@@ -478,10 +478,13 @@ class ExecRemoteProcess:
             from inspect_ai.util._sandbox.events import SandboxEnvironmentProxy
 
             self._request_id = uuid4().hex
+            # Acknowledge earlier terminal replies so the server can drop them.
+            acks, self._sandbox._exec_remote_acks = self._sandbox._exec_remote_acks, ()
             request = {
                 **params,
                 "request_id": self._request_id,
                 "wait_seconds": self._wait_seconds,
+                "acks": list(acks),
             }
             sandbox_proxy = cast(SandboxEnvironmentProxy, self._transport.sandbox)
             first_sent = time.monotonic()
@@ -598,6 +601,9 @@ class ExecRemoteProcess:
                     events.append(ExecStdout(data=result.stdout))
                 if result.stderr:
                     events.append(ExecStderr(data=result.stderr))
+
+                if result.state != "running" and self._request_id is not None:
+                    self._sandbox._exec_remote_acks += (self._request_id,)
 
                 # Check for terminal state
                 if result.state == "completed":
@@ -830,6 +836,7 @@ class ExecRemoteProcess:
                     {"request_id": self._request_id, "ack_seq": self._last_seq},
                     _KillResult,
                 )
+                self._sandbox._exec_remote_acks += (self._request_id,)
             else:
                 result = await self._rpc(
                     "exec_remote_kill",
