@@ -33,6 +33,7 @@ class OutputChunk(NamedTuple):
 
 _BACKPRESSURE_BUFFER_SIZE = 100 * 1024 * 1024  # 100 MiB
 _MAX_POLL_OUTPUT_BYTES = 1 * 1024 * 1024  # 1 MiB per poll response
+_READER_GRACE_SECONDS = 1.0  # after exit, for a child still holding the pipes
 
 
 def _leader_handle(process: AsyncIOProcess) -> psutil.Process | None:
@@ -134,6 +135,7 @@ class Job:
         self._acked_buffer: AckedChunkBuffer[tuple[str, str]] = AckedChunkBuffer()
         self._known_descendants: list[psutil.Process] = []
         self._retired = False
+        self._readers_deadline: float | None = None
 
         # Start background read tasks
         self._stdout_task = asyncio.create_task(
@@ -155,8 +157,8 @@ class Job:
         if self._state == "running" and self._process.returncode is not None:
             self._state = "completed"
             self._exit_code = self._process.returncode
-            # Wait for read tasks to finish draining
-            await self._wait_for_readers()
+        if self._state != "running":
+            await self._settle_readers()
 
         # Always limit per-poll output to keep JSON-RPC responses small.
         # Defer reporting terminal state until buffers are fully drained
@@ -190,6 +192,35 @@ class Job:
             stdout=combined_out,
             stderr=combined_err,
         )
+
+    def _buffered(self) -> int:
+        return max(self._stdout_buffer.size, self._stderr_buffer.size)
+
+    async def _settle_readers(self) -> None:
+        """After exit, let the readers reach EOF before closing the buffers.
+
+        Output written before exit is therefore never dropped. Readers still
+        running after the grace period (a child holding the pipes) are stopped,
+        even while a full reply is buffered, so completion is always reached;
+        what they buffered is still delivered.
+        """
+        readers = {t for t in (self._stdout_task, self._stderr_task) if not t.done()}
+        if not readers:
+            return
+        loop = asyncio.get_running_loop()
+        if self._readers_deadline is None:
+            self._readers_deadline = loop.time() + _READER_GRACE_SECONDS
+        remaining = self._readers_deadline - loop.time()
+        if remaining > 0:
+            if self._buffered() >= _MAX_POLL_OUTPUT_BYTES:
+                return  # send the full reply now; readers keep the rest of the grace
+            _, readers = await asyncio.wait(readers, timeout=remaining)
+        if readers:
+            self._stdout_buffer.close()
+            self._stderr_buffer.close()
+            for task in readers:
+                task.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
 
     async def kill(self, ack_seq: int, timeout: int = 5) -> OutputChunk:
         """Terminate the process and return any remaining buffered output.

@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import pytest
 from inspect_sandbox_tools._remote_tools._exec_remote import _job as job_module
 from inspect_sandbox_tools._remote_tools._exec_remote._controller import Controller
@@ -147,6 +148,50 @@ async def test_retired_job_shutdown_uses_only_its_captured_processes(
         process_group=False,
         known_descendants=[captured_child],
     )
+
+
+async def _poll_until_done(controller: Controller, pid: int) -> tuple[PollResult, str]:
+    """Poll like the host does, returning the terminal reply and all stdout."""
+    stdout, ack_seq = "", 0
+    while True:
+        result = await controller.poll(pid, ack_seq)
+        assert len(result.stdout) <= job_module._MAX_POLL_OUTPUT_BYTES
+        stdout, ack_seq = stdout + result.stdout, result.seq
+        if result.state != "running":
+            return result, stdout
+        await anyio.sleep(0.05)  # a host round trip between polls
+
+
+async def test_poll_keeps_output_a_child_writes_after_the_leader_exits() -> None:
+    """Buffers close only after the readers reach EOF, not when the leader exits."""
+    controller = Controller()
+    pid = await controller.submit("(sleep 0.3; printf late) & printf early")
+    try:
+        with anyio.fail_after(5):
+            result, stdout = await _poll_until_done(controller, pid)
+    finally:
+        await controller.shutdown()
+
+    assert result.state == "completed"
+    assert stdout == "earlylate"
+
+
+async def test_poll_completes_while_a_child_floods_the_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child that keeps writing after the leader exits cannot delay completion."""
+    monkeypatch.setattr(job_module, "_READER_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(job_module, "_BACKPRESSURE_BUFFER_SIZE", 4 * 1024 * 1024)
+    controller = Controller()
+    pid = await controller.submit("yes & sleep 0.3; exit 3")  # the pipe is full
+    try:
+        with anyio.fail_after(10):
+            result, _ = await _poll_until_done(controller, pid)
+    finally:
+        await controller.shutdown()
+
+    assert result.state == "completed"
+    assert result.exit_code == 3
 
 
 async def _stop_job(job: Job) -> None:

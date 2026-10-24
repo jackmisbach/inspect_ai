@@ -56,6 +56,11 @@ class BoundedByteBuffer:
         self._closed = True
         self._has_space.set()
 
+    @property
+    def size(self) -> int:
+        """Number of raw bytes available to drain."""
+        return len(self._buf)
+
 
 class DecodingBuffer:
     """Wraps a BoundedByteBuffer with an incremental UTF-8 decoder.
