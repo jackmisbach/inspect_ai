@@ -127,7 +127,9 @@ class Job:
                 process.stdin.close()
                 await process.stdin.wait_closed()
         except BaseException:
-            await job.shutdown()
+            # Not shutdown(): after the leader exits, its group id may be reused,
+            # and only server shutdown may signal the group without that check.
+            await job.kill(ack_seq=0)
             raise
 
         return job
