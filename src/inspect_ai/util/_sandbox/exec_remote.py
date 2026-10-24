@@ -119,9 +119,9 @@ class ExecRemoteCommonOptions:
     A poll that returns output is followed by another at once, without using up
     the ramp. In awaitable mode (`stream=False`), where the output is read only
     when the command ends, that next poll only checks whether the command has
-    ended: if it also returns output, it is followed by the same wait as a poll
-    with no output, unless either reply was full (`MAX_POLL_OUTPUT_BYTES` of
-    stdout or stderr)."""
+    ended: while polls in a row keep returning output, each later one is
+    followed by `OUTPUT_REPOLL_SECONDS` (whatever this is set to), unless a
+    reply is full (`MAX_POLL_OUTPUT_BYTES` of stdout or stderr)."""
 
     poll_timeout: float | None = None
     """Timeout for individual RPC poll requests in seconds. Defaults to 120 seconds.
@@ -242,6 +242,11 @@ before the default poll interval applies (not used when the caller sets
 `poll_interval`). Output does not restart the ramp, so a command that prints
 often is still polled at the interval once the ramp is used up."""
 
+OUTPUT_REPOLL_SECONDS = 0.5
+"""Wait in awaitable mode after a poll that returns output, not a full reply,
+when the poll before it did too (the command is still printing). Not stretched
+by `poll_interval`, which spaces polls that find no output."""
+
 MAX_POLL_OUTPUT_BYTES = 1024 * 1024
 """Most stdout (and stderr) bytes the sandbox returns in one poll reply (the
 sandbox tools' `_MAX_POLL_OUTPUT_BYTES`)."""
@@ -317,8 +322,8 @@ class ExecRemoteProcess:
             POLL_RAMP_SECONDS if options.poll_interval is None else ()
         )
         self._awaitable = False
-        # awaitable: the next poll checks at once whether the command has ended
-        self._end_check = False
+        # awaitable: the last poll returned output, not a full reply
+        self._small_output = False
         self._pid: int | None = None
         self._last_seq: int = 0
         self._killed = False
@@ -467,7 +472,7 @@ class ExecRemoteProcess:
 
                 # Still running with no output, wait before polling again
                 # (briefly for the first polls, see POLL_RAMP_SECONDS)
-                self._end_check = False
+                self._small_output = False
                 await anyio.sleep(next(self._poll_ramp, self._poll_interval))
 
         except anyio.get_cancelled_exc_class():
@@ -482,21 +487,18 @@ class ExecRemoteProcess:
         Nobody reads the output before the command ends, so the next poll goes
         out at once only to empty a full reply or to see whether the command
         has ended (the sandbox reports "running" in the poll that returns a
-        finished command's last output). If that check returns output too, the
-        command is still printing: wait as after a poll with no output, then
-        check again at once after the next output. A command's end is so seen
-        within one wait, as for a command without output.
+        finished command's last output). While polls in a row return output
+        that is not a full reply, the command is still printing: wait
+        `OUTPUT_REPOLL_SECONDS` after each, so its end is seen soon after.
         """
         # the sandbox's UTF-8 decoder holds back up to 3 bytes of a split character
         full = any(
             len(output.encode("utf-8")) >= MAX_POLL_OUTPUT_BYTES - 3
             for output in (result.stdout, result.stderr)
         )
-        if self._end_check and not full:
-            await anyio.sleep(next(self._poll_ramp, self._poll_interval))
-            self._end_check = False
-        else:
-            self._end_check = not full
+        if self._small_output and not full:
+            await anyio.sleep(OUTPUT_REPOLL_SECONDS)
+        self._small_output = not full
 
     async def _poll(self) -> _PollResult:
         recovery_deadline: float | None = None
