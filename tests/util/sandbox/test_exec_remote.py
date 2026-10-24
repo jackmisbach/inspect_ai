@@ -29,6 +29,7 @@ from inspect_ai.util._sandbox.events import (
     SandboxTimeoutError,
 )
 from inspect_ai.util._sandbox.exec_remote import (
+    MAX_POLL_OUTPUT_BYTES,
     ExecCompleted,
     ExecRemoteAwaitableOptions,
     ExecRemoteCommonOptions,
@@ -671,9 +672,10 @@ class TestAwaitableMode:
             ]
         )
 
-        result = await exec_remote_awaitable(
-            sandbox, ["cmd"], 5, ExecRemoteCommonOptions(poll_interval=0)
-        )
+        with patch.object(anyio, "sleep", AsyncMock()):
+            result = await exec_remote_awaitable(
+                sandbox, ["cmd"], 5, ExecRemoteCommonOptions(poll_interval=0)
+            )
 
         assert result.success is True
         assert result.stdout == "abc"
@@ -764,7 +766,19 @@ class TestPollRamp:
         assert [type(event) for event in events] == [ExecStdout, ExecCompleted]
         assert [call.args for call in sleep.await_args_list] == [(10,)]
 
-    async def test_output_polls_repoll_at_once_without_using_the_ramp(self) -> None:
+    @pytest.mark.parametrize(
+        ("stream", "waits"),
+        [
+            # one wait per idle poll, continuing the ramp across output polls
+            (True, [0.25, 0.5, 1.0, 2.0, 5]),
+            # and one after "c", which found the command still printing
+            (False, [0.25, 0.5, 1.0, 2.0, 5, 5]),
+        ],
+        ids=["streaming", "awaitable"],
+    )
+    async def test_output_polls_repoll_at_once_without_using_the_ramp(
+        self, stream: bool, waits: list[float]
+    ) -> None:
         sandbox = _make_scripted_sandbox(
             [
                 _start_response(),
@@ -782,18 +796,124 @@ class TestPollRamp:
         )
 
         with patch.object(anyio, "sleep", AsyncMock()) as sleep:
+            if stream:
+                proc = await exec_remote_streaming(sandbox, ["cmd"], 5)
+                events = [event async for event in proc]
+                stdout = "".join(e.data for e in events if isinstance(e, ExecStdout))
+            else:
+                stdout = (await exec_remote_awaitable(sandbox, ["cmd"], 5)).stdout
+
+        assert stdout == "abcde"
+        assert len(_polls(sandbox)) == 10
+        assert [call.args for call in sleep.await_args_list] == [(w,) for w in waits]
+
+
+# ============================================================================
+# Awaitable output polls
+# ============================================================================
+
+
+def _chatty_script(count: int) -> list[str | Exception]:
+    """A command that has printed a line by every poll, then ends."""
+    return [
+        _start_response(),
+        *[_running(f"{i}\n", seq=i) for i in range(1, count)],
+        _poll_response(stdout=f"{count}\n", seq=count),
+    ]
+
+
+class TestAwaitableOutputPolls:
+    """Awaitable mode re-polls at once after output only to see the end or empty a full reply."""
+
+    @pytest.mark.parametrize(
+        ("options", "waits"),
+        [
+            (None, [0.25, 0.5, 1.0, 2.0, 5]),
+            (ExecRemoteAwaitableOptions(poll_interval=12), [12] * 5),
+        ],
+        ids=["default", "poll_interval"],
+    )
+    async def test_chatty_command_waits_after_small_output(
+        self, options: ExecRemoteAwaitableOptions | None, waits: list[float]
+    ) -> None:
+        sandbox = _make_scripted_sandbox(_chatty_script(11))
+
+        with patch.object(anyio, "sleep", AsyncMock()) as sleep:
+            result = await exec_remote_awaitable(sandbox, ["cmd"], 5, options)
+
+        assert result.stdout == "".join(f"{i}\n" for i in range(1, 12))
+        assert len(_polls(sandbox)) == 11
+        # one check at once for the end after output, then a wait if still printing
+        assert [call.args for call in sleep.await_args_list] == [(w,) for w in waits]
+
+    async def test_streaming_chatty_command_repolls_at_once(self) -> None:
+        sandbox = _make_scripted_sandbox(_chatty_script(11))
+
+        with patch.object(anyio, "sleep", AsyncMock()) as sleep:
+            proc = await exec_remote_streaming(sandbox, ["cmd"], 5)
+            events = [event async for event in proc]
+
+        assert len(events) == 12
+        assert len(_polls(sandbox)) == 11
+        sleep.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "options",
+        [None, ExecRemoteAwaitableOptions(poll_interval=12)],
+        ids=["default", "poll_interval"],
+    )
+    async def test_end_is_seen_at_once_after_output(
+        self, options: ExecRemoteAwaitableOptions | None
+    ) -> None:
+        # the sandbox reports "running" in the poll that returns the last output
+        sandbox = _make_scripted_sandbox(
+            [_start_response(), _running("out", seq=1), _poll_response(seq=1)]
+        )
+
+        with patch.object(anyio, "sleep", AsyncMock()) as sleep:
+            result = await exec_remote_awaitable(sandbox, ["cmd"], 5, options)
+
+        assert result.stdout == "out"
+        assert len(_polls(sandbox)) == 2
+        sleep.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("stdout", "stderr", "waits"),
+        [
+            ("x" * MAX_POLL_OUTPUT_BYTES, "", []),
+            ("", "x" * MAX_POLL_OUTPUT_BYTES, []),
+            # a character split at the cap is held back until the next reply
+            ("x" * (MAX_POLL_OUTPUT_BYTES - 3), "", []),
+            ("\u00e9" * (MAX_POLL_OUTPUT_BYTES // 2), "", []),
+            ("x" * (MAX_POLL_OUTPUT_BYTES - 4), "", [0.25, 0.5]),
+        ],
+        ids=["stdout", "stderr", "held_back", "multibyte", "not_full"],
+    )
+    async def test_full_reply_repolls_at_once(
+        self, stdout: str, stderr: str, waits: list[float]
+    ) -> None:
+        def reply(seq: int) -> str:
+            return _poll_response(
+                state="running", exit_code=None, stdout=stdout, stderr=stderr, seq=seq
+            )
+
+        sandbox = _make_scripted_sandbox(
+            [
+                _start_response(),
+                _running("a", seq=1),
+                reply(2),
+                reply(3),
+                _running("b", seq=4),
+                _poll_response(seq=4),
+            ]
+        )
+
+        with patch.object(anyio, "sleep", AsyncMock()) as sleep:
             result = await exec_remote_awaitable(sandbox, ["cmd"], 5)
 
-        assert result.stdout == "abcde"
-        assert len(_polls(sandbox)) == 10
-        # one wait per idle poll, continuing the ramp across output polls
-        assert [call.args for call in sleep.await_args_list] == [
-            (0.25,),
-            (0.5,),
-            (1.0,),
-            (2.0,),
-            (5,),
-        ]
+        assert result.stdout == "a" + stdout * 2 + "b"
+        assert len(_polls(sandbox)) == 5
+        assert [call.args for call in sleep.await_args_list] == [(w,) for w in waits]
 
 
 # ============================================================================
