@@ -943,41 +943,59 @@ class TestAwaitableWaitProtocol:
         assert sandbox.requests[0][1]["wait_seconds"] == 2.0
         assert sandbox.exec.call_args.kwargs["timeout"] == 8
 
-    async def test_held_waits_are_bounded_by_their_own_limit(
+    async def test_no_free_held_slot_sends_requests_at_once_without_a_hold(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Other commands' holds never delay a start or poll; it is sent unheld."""
         monkeypatch.setenv("INSPECT_EXEC_REMOTE_WAIT_CONCURRENCY", "1")
         sandbox = _mock_sandbox()
         sandbox._exec_remote_wait_supported = None
-        in_flight: list[object] = []
-        peak = 0
-        entered, release = anyio.Event(), anyio.Event()
+        held, release = anyio.Event(), anyio.Event()
+        commands: dict[str, str] = {}
+        replies = [
+            _wait_response(state="running", exit_code=None, seq=1),
+            _wait_response(stdout="quick", seq=2),
+        ]
+        sent: list[tuple[str, str, float, bool]] = []
 
         async def fake_exec(*args: Any, **kwargs: Any) -> ExecResult[str]:
-            nonlocal peak
-            token = object()
-            in_flight.append(token)
-            peak = max(peak, len(in_flight))
-            entered.set()
-            await release.wait()
-            in_flight.remove(token)
-            return ExecResult(
-                success=True, returncode=0, stdout=_wait_response(), stderr=""
+            request = json.loads(kwargs["input"])
+            params = request["params"]
+            command = commands.setdefault(params["request_id"], params.get("command"))
+            sent.append(
+                (
+                    request["method"],
+                    command,
+                    params["wait_seconds"],
+                    kwargs["concurrency"],
+                )
             )
+            if command == "slow":
+                held.set()
+                await release.wait()
+                response = _wait_response(stdout="slow")
+            else:
+                response = replies.pop(0)
+            return ExecResult(success=True, returncode=0, stdout=response, stderr="")
 
         sandbox.exec = AsyncMock(side_effect=fake_exec)
-        async with anyio.create_task_group() as group:
-            for _ in range(2):
-                group.start_soon(exec_remote_awaitable, sandbox, ["cmd"], 5, _WAIT)
-            await entered.wait()
-            await anyio.wait_all_tasks_blocked()
-            release.set()
+        with patch.object(anyio, "sleep", AsyncMock()) as sleep:
+            async with anyio.create_task_group() as group:
+                group.start_soon(exec_remote_awaitable, sandbox, ["slow"], 5, _WAIT)
+                await held.wait()
+                # completes while the slow command still holds the only slot
+                with anyio.fail_after(5):
+                    quick = await exec_remote_awaitable(sandbox, ["quick"], 5, _WAIT)
+                release.set()
 
-        assert peak == 1
-        assert sandbox.exec.await_count == 2
-        assert not any(
-            call.kwargs["concurrency"] for call in sandbox.exec.call_args_list
-        )
+        assert quick.stdout == "quick"
+        assert sent == [
+            ("exec_remote_start_wait", "slow", 5.0, False),
+            ("exec_remote_start_wait", "quick", 0.0, True),
+            ("exec_remote_poll_wait", "quick", 0.0, True),
+        ]
+        # an unheld reply of a running command is followed by the poll interval
+        assert [call.args for call in sleep.await_args_list] == [(5,)]
 
     async def test_waits_stop_after_the_wait_window(self) -> None:
         sandbox = _make_scripted_sandbox(
@@ -996,7 +1014,8 @@ class TestAwaitableWaitProtocol:
             result = await exec_remote_awaitable(sandbox, ["cmd"], 5, _WAIT)
 
         assert result.stdout == "done"
-        assert [call.args for call in sleep.await_args_list] == [(5,), (5,)]
+        # the held start is followed by a poll at once; unheld polls by the interval
+        assert [call.args for call in sleep.await_args_list] == [(5,)]
         assert [params["wait_seconds"] for _, params in sandbox.requests] == [
             5.0,
             0.0,

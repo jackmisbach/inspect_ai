@@ -33,7 +33,10 @@ from inspect_ai._util._json_rpc import (
     exec_model_request,
 )
 from inspect_ai._util.cpu import effective_cpu_count
-from inspect_ai.util._concurrency import concurrency as concurrency_manager
+from inspect_ai.util._concurrency import (
+    ConcurrencySemaphore,
+    get_or_create_semaphore,
+)
 
 from ._cli import SANDBOX_CLI, tools_user_param
 from ._json_rpc_transport import SandboxJSONRPCTransport
@@ -194,7 +197,10 @@ class ExecRemoteAwaitableOptions(ExecRemoteCommonOptions):
     every `poll_interval`. Held requests do not take the subprocess or Docker
     CLI slots that ordinary commands need; with `concurrency`, at most
     `INSPECT_EXEC_REMOTE_WAIT_CONCURRENCY` of them (default: twice the
-    available CPUs, at least 4) are in flight at once.
+    available CPUs, at least 4) are in flight at once. A request never waits
+    for that limit: when it is reached, the request is sent without a hold, as
+    an ordinary command, and a command still running with no output is polled
+    again after `poll_interval`.
 
     A start that fails without an answer from the server (a lost connection, or
     a timeout unless `poll_timeout_retry` is False) is resent once with the same
@@ -378,6 +384,7 @@ class ExecRemoteProcess:
         self._request_id: str | None = None
         self._initial_result: _PollResult | None = None
         self._wait_until = 0.0
+        self._held = False  # whether the server held the last request
         rpc_timeout = (
             options.poll_timeout if options.poll_timeout is not None else RPC_TIMEOUT
         )
@@ -406,6 +413,15 @@ class ExecRemoteProcess:
     ) -> T:
         """Make an RPC call to the sandbox."""
         held = bool(params.get("wait_seconds"))
+        slot: ConcurrencySemaphore | None = None
+        if held and self._options.concurrency:
+            slot = await get_or_create_semaphore(
+                "exec-remote-wait", _wait_concurrency(), None, False
+            )
+            if slot.value < 1:
+                # Never wait for a free slot: send the request without a hold.
+                params, held, slot = {**params, "wait_seconds": 0.0}, False, None
+        self._held = held
         extra_args: dict[str, object] = dict(
             timeout=RPC_TIMEOUT
             if self._options.poll_timeout is None
@@ -421,12 +437,7 @@ class ExecRemoteProcess:
         )
         if self._options.poll_timeout_retry is not None:
             extra_args["timeout_retry"] = self._options.poll_timeout_retry
-        limit = (
-            concurrency_manager("exec-remote-wait", _wait_concurrency(), visible=False)
-            if held and self._options.concurrency
-            else contextlib.nullcontext()
-        )
-        async with limit:
+        async with slot.semaphore if slot is not None else contextlib.nullcontext():
             return await exec_model_request(
                 method=method,
                 params=params,
@@ -608,9 +619,9 @@ class ExecRemoteProcess:
                 if self._killed:
                     raise StopAsyncIteration
 
-                # Still running with no output: unless the server holds polls
-                # (within the wait window), wait before polling again
-                if time.monotonic() >= self._wait_until:
+                # Still running with no output: unless the server held the
+                # request, wait before polling again
+                if not self._held:
                     await anyio.sleep(self._poll_interval)
 
         except anyio.get_cancelled_exc_class():
