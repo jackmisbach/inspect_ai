@@ -108,7 +108,13 @@ class ExecRemoteCommonOptions:
     """User to run the command as"""
 
     poll_interval: float | None = None
-    """Interval between poll requests in seconds"""
+    """Interval between poll requests in seconds (at least 5).
+
+    The first polls that find the command still running with no output are
+    followed by shorter waits of 0.25, 0.5, 1 and 2 seconds (`POLL_RAMP_SECONDS`)
+    before this interval applies, so a short command is not left waiting a whole
+    interval. A poll that returns output is followed by another at once, without
+    using up the ramp."""
 
     poll_timeout: float | None = None
     """Timeout for individual RPC poll requests in seconds. Defaults to 120 seconds.
@@ -223,6 +229,11 @@ class _CloseStdinResult(BaseModel):
 
 MIN_POLL_INTERVAL = 5
 
+POLL_RAMP_SECONDS = (0.25, 0.5, 1.0, 2.0)
+"""Waits after the first polls that find a command still running with no output,
+before the poll interval applies. Output does not restart the ramp, so a command
+that prints often is still polled at the interval once the ramp is used up."""
+
 RPC_TIMEOUT = 120
 """Timeout for individual JSON-RPC calls in seconds."""
 
@@ -290,6 +301,7 @@ class ExecRemoteProcess:
         self._poll_interval = max(
             MIN_POLL_INTERVAL, options.poll_interval or sandbox_default_poll_interval
         )
+        self._poll_ramp = iter(POLL_RAMP_SECONDS)
         self._pid: int | None = None
         self._last_seq: int = 0
         self._killed = False
@@ -435,7 +447,8 @@ class ExecRemoteProcess:
                     raise StopAsyncIteration
 
                 # Still running with no output, wait before polling again
-                await anyio.sleep(self._poll_interval)
+                # (briefly for the first polls, see POLL_RAMP_SECONDS)
+                await anyio.sleep(next(self._poll_ramp, self._poll_interval))
 
         except anyio.get_cancelled_exc_class():
             # Kill the process on cancellation to avoid leaving orphaned processes.
