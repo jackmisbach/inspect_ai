@@ -205,11 +205,13 @@ class ExecRemoteAwaitableOptions(ExecRemoteCommonOptions):
     A start that fails without an answer from the server (a lost connection, or
     a timeout unless `poll_timeout_retry` is False) is resent once with the same
     request ID, within 60 seconds of the first attempt. The server then reports
-    the command it already launched while it runs, or an error once it has
-    finished (the server does not keep a finished command's result), instead of
-    launching it again. It remembers request IDs for an hour after the command
-    finishes, but not across a restart of the sandbox tools server. Servers
-    without support are polled as usual.
+    the command it already launched while it runs, instead of launching it
+    again. Once the command has finished the server does not keep its result,
+    so the resent start fails with an error that says the result was lost and
+    how the command ended (for example its exit code). The server remembers
+    request IDs for an hour after the command finishes, but not across a
+    restart of the sandbox tools server. Servers without support are polled as
+    usual.
     """
 
 

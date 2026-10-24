@@ -83,9 +83,10 @@ async def test_finished_request_is_not_launched_again(
     first = await controller.start(params)
     assert first.result.stdout == "answer"
 
-    with pytest.raises(ToolException, match="result expired"):
+    lost = "result lost: the command ran and exited with code 0"
+    with pytest.raises(ToolException, match=lost):
         await controller.start(params)
-    with pytest.raises(ToolException, match="result expired"):
+    with pytest.raises(ToolException, match=lost):
         await controller.poll(params.request_id, 0, 0.0)
     assert (await controller.kill(params.request_id, 0)).stdout == ""
     assert marker.read_text() == "x"
@@ -333,6 +334,25 @@ async def test_launch_error_is_raised_as_a_legacy_start_raises_it(
     assert repr(waited.value) == repr(legacy.value)
 
 
+async def test_a_lost_result_says_how_the_command_ended(
+    controller: WaitController, tmp_path: Path
+) -> None:
+    failed = _params("true", cwd=str(tmp_path / "missing"))
+    with pytest.raises(FileNotFoundError):
+        await controller.start(failed)
+    killed = _params("sleep 60")
+    killed.wait_seconds = 0.0
+    await controller.start(killed)
+    await controller.kill(killed.request_id, 0)
+
+    with pytest.raises(ToolException, match=r"could not be started \(FileNotFound"):
+        await controller.start(failed)
+    with pytest.raises(
+        ToolException, match="result lost: the command ran and was killed"
+    ):
+        await controller.start(killed)
+
+
 async def test_kill_before_start_prevents_a_late_launch(
     controller: WaitController, tmp_path: Path
 ) -> None:
@@ -340,7 +360,7 @@ async def test_kill_before_start_prevents_a_late_launch(
     params = _params(f"printf unexpected > {shlex.quote(str(marker))}")
 
     await controller.kill(params.request_id, 0)
-    with pytest.raises(ToolException):
+    with pytest.raises(ToolException, match="cancelled before it started"):
         await controller.start(params)
 
     assert not marker.exists()

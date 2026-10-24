@@ -4,6 +4,7 @@ import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from time import monotonic
+from typing import NamedTuple
 
 from inspect_sandbox_tools._util.common_types import ToolException
 
@@ -11,7 +12,7 @@ from ._job import Job
 from .tool_types import KillResult, PollResult, StartWaitParams, WaitResult
 
 _EXPIRED_ID_TTL = 3600.0
-_MAX_EXPIRED_IDS = 50_000  # about 10 MB
+_MAX_EXPIRED_IDS = 50_000  # about 13 MB
 _LAUNCH_SHUTDOWN_GRACE = 1.0
 
 
@@ -29,6 +30,25 @@ class _Request:
     finished_at: float | None = None
 
 
+class _Expired(NamedTuple):
+    at: float
+    outcome: int | str
+    """The exit code of a command that completed, or what else happened to it."""
+
+
+def _outcome(entry: _Request) -> int | str:
+    response = entry.response
+    if response is not None and response.exit_code is not None:
+        return response.exit_code
+    if response is not None and response.state == "killed":
+        return "ran and was killed"
+    if entry.error is not None and entry.job is None:
+        return f"could not be started ({entry.error!r})"
+    if entry.error is not None:
+        return f"was stopped when its input could not be written ({entry.error!r})"
+    return "was cancelled before it started"
+
+
 class WaitController:
     """Own launches independently of RPC cancellation.
 
@@ -40,7 +60,7 @@ class WaitController:
 
     def __init__(self) -> None:
         self._requests: dict[str, _Request] = {}
-        self._expired: OrderedDict[str, float] = OrderedDict()
+        self._expired: OrderedDict[str, _Expired] = OrderedDict()
         self._retired_jobs: list[Job] = []
 
     async def start(
@@ -169,8 +189,15 @@ class WaitController:
         self._prune()
         entry = self._requests.get(request_id)
         if entry is None:
-            if request_id in self._expired:
-                raise ToolException(f"exec_remote request {request_id} result expired")
+            if (expired := self._expired.get(request_id)) is not None:
+                outcome = expired.outcome
+                if isinstance(outcome, int):
+                    outcome = f"ran and exited with code {outcome}"
+                raise ToolException(
+                    f"exec_remote request {request_id} result lost: the command "
+                    f"{outcome}. Its output is no longer kept, and the command is "
+                    "not run again."
+                )
             raise ToolException(f"Unknown or expired exec_remote request {request_id}")
         return entry
 
@@ -180,17 +207,19 @@ class WaitController:
             # Raised as exec_remote_start raises it, so the host sees the same error.
             raise entry.error
         if entry.job is None:
-            raise ToolException(f"Cancelled exec_remote request {request_id}")
+            raise ToolException(
+                f"exec_remote request {request_id} was cancelled before it started"
+            )
         return entry.job
 
     def _prune(self) -> None:
         """Forget finished requests, keeping their IDs.
 
         A finished request's terminal reply is not kept once it has been sent:
-        its entry is dropped, and a repeated start or poll of it fails as
-        expired. Its ID is kept, without output, for `_EXPIRED_ID_TTL` (at most
-        `_MAX_EXPIRED_IDS` of them), so a late repeated start fails instead of
-        launching again.
+        its entry is dropped. Its ID is kept, with how the command ended but
+        without output, for `_EXPIRED_ID_TTL` (at most `_MAX_EXPIRED_IDS` of
+        them), so a late repeated start or poll fails, saying the result was
+        lost and how the command ended, instead of launching it again.
         """
         for key, entry in list(self._requests.items()):
             if entry.finished_at is not None:
@@ -198,13 +227,13 @@ class WaitController:
         now = monotonic()
         while self._expired and (
             len(self._expired) > _MAX_EXPIRED_IDS
-            or now - next(iter(self._expired.values())) >= _EXPIRED_ID_TTL
+            or now - next(iter(self._expired.values())).at >= _EXPIRED_ID_TTL
         ):
             self._expired.popitem(last=False)
 
     def _evict(self, key: str, entry: _Request) -> None:
         self._requests.pop(key, None)
-        self._expired[key] = monotonic()
+        self._expired[key] = _Expired(monotonic(), _outcome(entry))
         if entry.job is not None:
             entry.job.retire()
             entry.job.release_output()
