@@ -8,7 +8,8 @@ Docker container to verify the full host-to-container path.
 import contextlib
 import json
 from collections.abc import Iterator
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 from unittest.mock import AsyncMock, patch
 
 import anyio
@@ -18,6 +19,12 @@ from tenacity.wait import wait_none
 from test_helpers.utils import skip_if_no_docker
 
 import inspect_ai.util._sandbox.exec_remote as exec_remote_module
+from inspect_ai import Task, eval
+from inspect_ai.analysis import events_df
+from inspect_ai.dataset import Sample
+from inspect_ai.event import SandboxEvent
+from inspect_ai.log import read_eval_log
+from inspect_ai.solver import Generate, Solver, TaskState, solver
 from inspect_ai.tool._sandbox_tools_utils.sandbox import (
     SandboxInjectionError,
     _inject_container_tools_code,
@@ -1285,6 +1292,47 @@ class TestAwaitableWaitProtocol:
                 ExecRemoteAwaitableOptions(timeout=0.01, server_wait=True),
             )
         assert requests == ["exec_remote_start_wait", "exec_remote_kill_wait"]
+
+
+@pytest.mark.parametrize("log_format", ["eval", "json"])
+def test_start_event_without_output_reads_back_from_a_log(
+    tmp_path: Path, log_format: Literal["eval", "json"]
+) -> None:
+    """Log readers and the event dataframe, unchanged here, accept `output=None`."""
+
+    @solver
+    def server_wait_command() -> Solver:
+        async def solve(state: TaskState, generate: Generate) -> TaskState:
+            sandbox = _make_scripted_sandbox([_wait_response(stdout="out")])
+            sandbox._exec_remote_wait_supported = None
+            proxy = SandboxEnvironmentProxy(sandbox)
+            result = await exec_remote_awaitable(proxy, ["cat", "f"], 5, _WAIT)
+            assert result.stdout == "out"
+            return state
+
+        return solve
+
+    task = Task(dataset=[Sample(input="x")], solver=server_wait_command())
+    [log] = eval(
+        task,
+        model="mockllm/model",
+        log_dir=str(tmp_path),
+        log_format=log_format,
+        display="none",
+    )
+
+    assert log.status == "success" and log.location
+    [sample] = read_eval_log(log.location).samples or []
+    [event] = [event for event in sample.events if isinstance(event, SandboxEvent)]
+    assert (event.action, event.cmd, event.result, event.output) == (
+        "exec",
+        f"{SANDBOX_CLI} exec",
+        0,
+        None,
+    )
+    assert json.loads(event.input or "")["method"] == "exec_remote_start_wait"
+    events = events_df(log.location, filter=lambda e: e.event == "sandbox", quiet=True)
+    assert events["event"].tolist() == ["sandbox"]
 
 
 # ============================================================================
