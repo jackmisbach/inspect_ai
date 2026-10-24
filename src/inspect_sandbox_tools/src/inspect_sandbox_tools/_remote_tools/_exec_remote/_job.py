@@ -164,6 +164,11 @@ class Job:
         assert self._process.pid is not None
         return self._process.pid
 
+    @property
+    def exited(self) -> bool:
+        """Whether the process has exited (its output may still be unread)."""
+        return self._process.returncode is not None
+
     async def poll(self, ack_seq: int, *, terminal_output: bool = False) -> PollResult:
         """Return current state and incremental output, clearing buffers."""
         # Check if process has finished
@@ -270,12 +275,19 @@ class Job:
             await asyncio.gather(*readers, return_exceptions=True)
 
     def release_output(self) -> None:
-        """Release replay data while preserving descendant handles for shutdown."""
+        """Release replay data while preserving descendant handles for shutdown.
+
+        Output still arriving from descendants is discarded.
+        """
         self._acked_buffer = AckedChunkBuffer()
+        self._stdout_buffer.close()
+        self._stderr_buffer.close()
         self._stdout_buffer.drain()
         self._stderr_buffer.drain()
 
-    async def kill(self, ack_seq: int, timeout: int = 5) -> OutputChunk:
+    async def kill(
+        self, ack_seq: int, timeout: int = 5, *, drain_terminal: bool = False
+    ) -> OutputChunk:
         """Terminate the process and return any remaining buffered output.
 
         Since the subprocess was started with start_new_session=True, it is the
@@ -288,8 +300,12 @@ class Job:
         as root would then signal. A job whose leader exited on its own is
         treated as finished: its buffered output is returned and any children
         that outlived it may be left running.
+
+        With ``drain_terminal`` (the awaitable protocol), a job that already ended
+        is killed too, and the reply holds at most one poll reply of output: the
+        host reads nothing after a kill, so the rest is dropped.
         """
-        if self._state != "running":
+        if self._state != "running" and not drain_terminal:
             self._acked_buffer.push(("", ""))
             seq, chunks = self._acked_buffer.collect(ack_seq)
             return OutputChunk(seq, *self._combine_chunks(chunks))
@@ -311,7 +327,14 @@ class Job:
 
         await self._wait_for_readers()
 
-        stdout, stderr = self._drain_buffers(final=True)
+        if drain_terminal:
+            stdout, stderr = self._drain_buffers(
+                final=True, max_bytes=_MAX_POLL_OUTPUT_BYTES
+            )
+            self._stdout_buffer.drain()
+            self._stderr_buffer.drain()
+        else:
+            stdout, stderr = self._drain_buffers(final=True)
         self._acked_buffer.push((stdout, stderr))
         seq, chunks = self._acked_buffer.collect(ack_seq)
         return OutputChunk(seq, *self._combine_chunks(chunks))

@@ -1,6 +1,7 @@
-"""Request-owned commands with bounded waits."""
+"""Request-owned commands with bounded waits and terminal-response replay."""
 
 import asyncio
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from time import monotonic
@@ -11,6 +12,9 @@ from inspect_sandbox_tools._util.common_types import ToolException
 from ._job import Job
 from .tool_types import KillResult, PollResult, StartWaitParams, WaitResult
 
+_TERMINAL_TTL = 300.0
+_MAX_ACKNOWLEDGED_ENTRIES = 256
+_MAX_RETAINED_BYTES = 64 * 1024 * 1024
 _EXPIRED_ID_TTL = 3600.0
 _MAX_EXPIRED_IDS = 50_000  # about 13 MB
 _LAUNCH_SHUTDOWN_GRACE = 1.0
@@ -28,6 +32,16 @@ class _Request:
     error: Exception | None = None
     response: PollResult | None = None
     finished_at: float | None = None
+    acknowledged: bool = False
+    seen_at: float = 0.0  # last start or poll of this request
+
+
+def _retained_bytes(entry: _Request) -> int:
+    """Memory held by a finished request's reply output."""
+    response = entry.response
+    if response is None:
+        return 0
+    return sys.getsizeof(response.stdout) + sys.getsizeof(response.stderr)
 
 
 class _Expired(NamedTuple):
@@ -50,7 +64,7 @@ def _outcome(entry: _Request) -> int | str:
 
 
 class WaitController:
-    """Own launches independently of RPC cancellation.
+    """Own launches independently of RPC cancellation and retain bounded replay.
 
     Request IDs must never be reused by clients. A repeated start with a known
     ID reports that request instead of launching again. Retention is described
@@ -67,6 +81,7 @@ class WaitController:
         self, params: StartWaitParams, can_switch_user: bool = False
     ) -> WaitResult:
         """Register a unique request before launching and wait briefly for completion."""
+        self._acknowledge(params.acks)
         self._prune()
         if params.request_id in self._requests or params.request_id in self._expired:
             # A retried start (e.g. after a dropped connection) acts as a poll; a
@@ -74,7 +89,7 @@ class WaitController:
             return await self.poll(params.request_id, 0, params.wait_seconds)
         if params.stdin_open:
             raise ToolException("Awaitable exec_remote requests cannot keep stdin open")
-        entry = _Request()
+        entry = _Request(seen_at=monotonic())
         self._requests[params.request_id] = entry
         entry.launch = asyncio.create_task(self._launch(entry, params, can_switch_user))
         await asyncio.shield(entry.launch)
@@ -121,6 +136,7 @@ class WaitController:
 
     async def _poll(self, entry: _Request, request_id: str, ack_seq: int) -> WaitResult:
         async with entry.lock:
+            entry.seen_at = monotonic()
             job = self._job(entry, request_id)
             if entry.response is not None and ack_seq < entry.response.seq:
                 result = entry.response
@@ -173,7 +189,13 @@ class WaitController:
                     entry.finished_at = monotonic()
                 self._prune()
                 return KillResult(seq=0, stdout="", stderr="")
-            seq, stdout, stderr = await entry.job.kill(ack_seq)
+            if entry.response is not None and entry.response.state != "running":
+                # The command already ended: keep its final reply for replay.
+                response = entry.response
+                return KillResult(
+                    seq=response.seq, stdout=response.stdout, stderr=response.stderr
+                )
+            seq, stdout, stderr = await entry.job.kill(ack_seq, drain_terminal=True)
             entry.response = PollResult(
                 state="killed", seq=seq, stdout=stdout, stderr=stderr
             )
@@ -212,19 +234,63 @@ class WaitController:
             )
         return entry.job
 
-    def _prune(self) -> None:
-        """Forget finished requests, keeping their IDs.
+    def _acknowledge(self, request_ids: list[str]) -> None:
+        """Drop output the host has received, keeping the duplicate-start marker."""
+        for request_id in request_ids:
+            entry = self._requests.get(request_id)
+            if entry is None or entry.response is None or entry.finished_at is None:
+                continue
+            entry.acknowledged = True
+            entry.response = entry.response.model_copy(
+                update={"stdout": "", "stderr": ""}
+            )
+            if entry.job is not None:
+                entry.job.release_output()
 
-        A finished request's terminal reply is not kept once it has been sent:
-        its entry is dropped. Its ID is kept, with how the command ended but
-        without output, for `_EXPIRED_ID_TTL` (at most `_MAX_EXPIRED_IDS` of
-        them), so a late repeated start or poll fails, saying the result was
-        lost and how the command ended, instead of launching it again.
+    def _prune(self) -> None:
+        """Expire finished requests.
+
+        Guarantee: a terminal reply the host has not acknowledged stays
+        replayable for `_TERMINAL_TTL` seconds after the command finished, unless
+        unacknowledged replies together hold more than `_MAX_RETAINED_BYTES` of
+        output, when the oldest are dropped first. Hosts acknowledge terminal
+        replies on a later start; acknowledged entries hold no output and only
+        stop a late duplicate start, and the oldest beyond
+        `_MAX_ACKNOWLEDGED_ENTRIES` are dropped early. A command that exited but
+        has not been polled for `_TERMINAL_TTL` seconds is dropped too.
+        A dropped request's ID is kept, with how the command ended but without
+        output, for `_EXPIRED_ID_TTL` (at most `_MAX_EXPIRED_IDS` of them), so a
+        late repeated start or replay of it fails, saying the result was lost
+        and how the command ended, instead of launching it again.
         """
-        for key, entry in list(self._requests.items()):
-            if entry.finished_at is not None:
-                self._evict(key, entry)
         now = monotonic()
+        acknowledged: list[tuple[str, _Request]] = []
+        unacknowledged: list[tuple[str, _Request]] = []
+        for key, entry in sorted(
+            self._requests.items(), key=lambda item: item[1].finished_at or 0
+        ):
+            if entry.finished_at is None:
+                if (
+                    entry.job is not None
+                    and entry.job.exited
+                    and now - entry.seen_at >= _TERMINAL_TTL
+                ):
+                    self._evict(key, entry)
+            elif now - entry.finished_at >= _TERMINAL_TTL:
+                self._evict(key, entry)
+            elif entry.acknowledged:
+                acknowledged.append((key, entry))
+            else:
+                unacknowledged.append((key, entry))
+        excess = len(acknowledged) - _MAX_ACKNOWLEDGED_ENTRIES
+        for key, entry in acknowledged[: max(excess, 0)]:
+            self._evict(key, entry)
+        retained = sum(_retained_bytes(entry) for _, entry in unacknowledged)
+        for key, entry in unacknowledged:
+            if retained <= _MAX_RETAINED_BYTES:
+                break
+            retained -= _retained_bytes(entry)
+            self._evict(key, entry)
         while self._expired and (
             len(self._expired) > _MAX_EXPIRED_IDS
             or now - next(iter(self._expired.values())).at >= _EXPIRED_ID_TTL

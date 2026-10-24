@@ -49,6 +49,8 @@ class StartWaitParams(SubmitParams):
 
     request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     wait_seconds: WaitSeconds
+    acks: list[str] = []
+    """Request IDs whose terminal replies the host has received."""
     model_config = {"extra": "ignore"}
 
 

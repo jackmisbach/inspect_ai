@@ -74,21 +74,20 @@ async def test_start_preserves_stderr_and_nonzero_exit(
     assert reply.result.stderr == "err"
 
 
-async def test_finished_request_is_not_launched_again(
+async def test_lost_terminal_reply_is_replayed_without_relaunch(
     controller: WaitController, tmp_path: Path
 ) -> None:
-    """A finished request's reply is not kept; repeating it fails, never relaunches."""
     marker = tmp_path / "launches"
     params = _params(f"printf x >> {shlex.quote(str(marker))}; printf answer")
     first = await controller.start(params)
-    assert first.result.stdout == "answer"
+    replay = await controller.poll(params.request_id, 0, 0.0)
+    restart = await controller.start(params)
 
-    lost = "result lost: the command ran and exited with code 0"
-    with pytest.raises(ToolException, match=lost):
-        await controller.start(params)
-    with pytest.raises(ToolException, match=lost):
-        await controller.poll(params.request_id, 0, 0.0)
-    assert (await controller.kill(params.request_id, 0)).stdout == ""
+    for reply in (replay, restart):
+        assert reply.result.state == first.result.state == "completed"
+        assert reply.result.stdout == first.result.stdout == "answer"
+        assert reply.result.exit_code == first.result.exit_code == 0
+        assert reply.pid == first.pid
     assert marker.read_text() == "x"
 
 
@@ -335,7 +334,7 @@ async def test_launch_error_is_raised_as_a_legacy_start_raises_it(
 
 
 async def test_a_lost_result_says_how_the_command_ended(
-    controller: WaitController, tmp_path: Path
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     failed = _params("true", cwd=str(tmp_path / "missing"))
     with pytest.raises(FileNotFoundError):
@@ -344,6 +343,8 @@ async def test_a_lost_result_says_how_the_command_ended(
     killed.wait_seconds = 0.0
     await controller.start(killed)
     await controller.kill(killed.request_id, 0)
+    monkeypatch.setattr(wait_module, "_TERMINAL_TTL", 0.0)
+    controller._prune()
 
     with pytest.raises(ToolException, match=r"could not be started \(FileNotFound"):
         await controller.start(failed)
@@ -464,8 +465,41 @@ async def test_cancelled_failed_launch_is_prunable(
             await killing.wait()
             release.set()
 
+    monkeypatch.setattr(wait_module, "_TERMINAL_TTL", 0.0)
     controller._prune()
     assert params.request_id not in controller._requests
+
+
+async def test_killed_output_is_replayed_after_a_lost_kill_reply(
+    controller: WaitController,
+) -> None:
+    params = _params(_python("import time; print('ready', flush=True); time.sleep(60)"))
+    first = await controller.start(params)
+    assert first.result.stdout == "ready\n"
+
+    killed = await controller.kill(params.request_id, 0)
+    replay = await controller.poll(params.request_id, 0, 0.0)
+    acknowledged = await controller.poll(params.request_id, replay.result.seq, 0.0)
+
+    assert replay.result.state == "killed"
+    assert killed.stdout == replay.result.stdout == "ready\n"
+    assert acknowledged.result.stdout == ""
+    assert acknowledged.result.state == "killed"
+
+
+async def test_kill_after_completion_keeps_the_completed_reply(
+    controller: WaitController,
+) -> None:
+    params = _params("printf done; exit 3")
+    assert (await controller.start(params)).result.state == "completed"
+
+    killed = await controller.kill(params.request_id, 0)
+    replay = await controller.poll(params.request_id, 0, 0.0)
+
+    assert killed.stdout == "done"
+    assert replay.result.state == "completed"
+    assert replay.result.exit_code == 3
+    assert replay.result.stdout == "done"
 
 
 async def test_kill_wakes_an_inflight_long_poll(controller: WaitController) -> None:
@@ -496,10 +530,12 @@ async def test_cancelled_kill_does_not_retain_completed_output_task(
     returned = anyio.Event()
     original_kill = Job.kill
 
-    async def delayed_kill(job: Job, ack_seq: int, timeout: int = 5) -> OutputChunk:
+    async def delayed_kill(
+        job: Job, ack_seq: int, timeout: int = 5, *, drain_terminal: bool = False
+    ) -> OutputChunk:
         entered.set()
         await release.wait()
-        return await original_kill(job, ack_seq, timeout)
+        return await original_kill(job, ack_seq, timeout, drain_terminal=drain_terminal)
 
     monkeypatch.setattr(Job, "kill", delayed_kill)
     params = _params(_python("import time; print('ready', flush=True); time.sleep(60)"))
@@ -532,7 +568,61 @@ async def test_cancelled_kill_does_not_retain_completed_output_task(
 
     assert result.stdout == "ready\n"
     assert entry.stop is None
+    acknowledged = await controller.poll(params.request_id, result.seq, 0.0)
+    assert acknowledged.result.stdout == ""
+
+
+@pytest.mark.parametrize("launched", [False, True])
+async def test_repeated_kill_does_not_extend_terminal_ttl(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch, launched: bool
+) -> None:
+    params = _params("sleep 60")
+    params.wait_seconds = 0.0
+    if launched:
+        await controller.start(params)
+    clock = [10.0]
+    monkeypatch.setattr(wait_module, "monotonic", lambda: clock[0])
+    await controller.kill(params.request_id, 0)
+    clock[0] = 200.0
+    await controller.kill(params.request_id, 0)
+    clock[0] = 310.1
+    controller._prune()
+
     assert params.request_id not in controller._requests
+
+
+async def test_terminal_replay_expires(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    params = _params("printf done")
+    reply = await controller.start(params)
+    assert reply.result.state == "completed"
+
+    monkeypatch.setattr(wait_module, "_TERMINAL_TTL", 0.0)
+    controller._prune()
+
+    with pytest.raises(ToolException):
+        await controller.poll(params.request_id, 0, 0.0)
+
+
+async def test_start_after_the_reply_expired_does_not_relaunch(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    marker = tmp_path / "launches"
+    params = _params(f"printf x >> {shlex.quote(str(marker))}")
+    assert (await controller.start(params)).result.state == "completed"
+    monkeypatch.setattr(wait_module, "_TERMINAL_TTL", 0.0)
+    controller._prune()
+
+    with pytest.raises(
+        ToolException, match="result lost: the command ran and exited with code 0"
+    ):
+        await controller.start(params)
+    with pytest.raises(
+        ToolException, match="result lost: the command ran and exited with code 0"
+    ):
+        await controller.poll(params.request_id, 0, 0.0)
+    assert marker.read_text() == "x"
 
 
 async def test_expired_ids_are_forgotten_beyond_their_bounds(
@@ -540,6 +630,7 @@ async def test_expired_ids_are_forgotten_beyond_their_bounds(
 ) -> None:
     clock = [0.0]
     monkeypatch.setattr(wait_module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(wait_module, "_TERMINAL_TTL", 0.0)
     monkeypatch.setattr(wait_module, "_MAX_EXPIRED_IDS", 2)
     requests = [_params("true") for _ in range(3)]
     for params in requests:
@@ -549,6 +640,141 @@ async def test_expired_ids_are_forgotten_beyond_their_bounds(
     clock[0] = wait_module._EXPIRED_ID_TTL
     controller._prune()
     assert not controller._expired
+
+
+async def test_unacknowledged_replies_survive_other_output(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(wait_module, "_MAX_ACKNOWLEDGED_ENTRIES", 0)
+    output = "x" * 512 * 1024
+    requests = [
+        _params(_python(f"print('x' * {len(output)}, end='')")) for _ in range(5)
+    ]
+    for params in requests:
+        reply = await controller.start(params)
+        assert reply.result.state == "completed"
+    controller._prune()
+
+    for params in requests:
+        replay = await controller.poll(params.request_id, 0, 0.0)
+        assert replay.result.stdout == output
+
+
+async def test_retained_replies_are_bounded_in_total(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = "x" * 4096
+    reply_bytes = sys.getsizeof(output) + sys.getsizeof("")
+    monkeypatch.setattr(wait_module, "_MAX_RETAINED_BYTES", 3 * reply_bytes)
+    requests = [
+        _params(_python(f"print('x' * {len(output)}, end='')")) for _ in range(4)
+    ]
+    for params in requests:
+        assert (await controller.start(params)).result.state == "completed"
+
+    with pytest.raises(
+        ToolException, match="result lost: the command ran and exited with code 0"
+    ):
+        await controller.poll(requests[0].request_id, 0, 0.0)
+    for params in requests[1:]:
+        assert (
+            await controller.poll(params.request_id, 0, 0.0)
+        ).result.stdout == output
+
+
+async def test_kill_reply_holds_at_most_one_reply_of_output(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(job_module, "_MAX_POLL_OUTPUT_BYTES", 8)
+    params = _params(
+        _python("import time; print('x' * 64, end='', flush=True); time.sleep(60)")
+    )
+    params.wait_seconds = 0.0
+    first = await controller.start(params)
+    job = controller._requests[params.request_id].job
+    assert job is not None
+    with anyio.fail_after(5):
+        while len(first.result.stdout) + job._stdout_buffer.size < 64:
+            await anyio.sleep(0.05)
+
+    killed = await controller.kill(params.request_id, first.result.seq)
+
+    assert killed.stdout == "x" * 8
+    assert job._stdout_buffer.size == 0
+
+
+async def test_an_exited_request_nobody_polls_expires(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(wait_module, "monotonic", lambda: clock[0])
+    params = _params("sleep 0.2")
+    params.wait_seconds = 0.0
+    assert (await controller.start(params)).result.state == "running"
+    job = controller._requests[params.request_id].job
+    assert job is not None
+    with anyio.fail_after(5):
+        while job._process.returncode is None:
+            await anyio.sleep(0.05)
+
+    clock[0] = wait_module._TERMINAL_TTL
+    controller._prune()
+
+    assert params.request_id not in controller._requests
+
+
+async def test_acknowledged_reply_keeps_only_a_marker(
+    controller: WaitController, tmp_path: Path
+) -> None:
+    marker = tmp_path / "launches"
+    params = _params(f"printf x >> {shlex.quote(str(marker))}; printf answer")
+    first = await controller.start(params)
+    assert first.result.stdout == "answer"
+
+    await controller.start(_params("true", acks=[params.request_id]))
+    restart = await controller.start(params)
+
+    assert restart.pid == first.pid
+    assert restart.result.state == "completed"
+    assert restart.result.stdout == ""
+    assert marker.read_text() == "x"
+
+
+async def test_acknowledged_entry_count_is_bounded(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(wait_module, "_MAX_ACKNOWLEDGED_ENTRIES", 1)
+    requests = [_params("printf done") for _ in range(3)]
+    for params in requests:
+        reply = await controller.start(params)
+        assert reply.result.state == "completed"
+    await controller.start(
+        _params("true", acks=[params.request_id for params in requests[:2]])
+    )
+
+    with pytest.raises(ToolException):
+        await controller.poll(requests[0].request_id, 0, 0.0)
+    acknowledged = await controller.poll(requests[1].request_id, 0, 0.0)
+    assert acknowledged.result.stdout == ""
+    unacknowledged = await controller.poll(requests[2].request_id, 0, 0.0)
+    assert unacknowledged.result.stdout == "done"
+
+
+async def test_retention_limits_do_not_evict_running_jobs(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(wait_module, "_MAX_ACKNOWLEDGED_ENTRIES", 0)
+    running = _params("sleep 60")
+    running.wait_seconds = 0.0
+    started = await controller.start(running)
+    for _ in range(2):
+        completed = await controller.start(_params("true", acks=[running.request_id]))
+        assert completed.result.state == "completed"
+    controller._prune()
+
+    remaining = await controller.poll(running.request_id, started.result.seq, 0.0)
+    assert remaining.pid == started.pid
+    assert remaining.result.state == "running"
 
 
 def test_long_wait_duration_is_clamped() -> None:
