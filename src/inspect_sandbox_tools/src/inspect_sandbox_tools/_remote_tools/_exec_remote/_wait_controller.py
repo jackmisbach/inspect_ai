@@ -37,11 +37,18 @@ class _Request:
 
 
 def _retained_bytes(entry: _Request) -> int:
-    """Memory held by a finished request's reply output."""
-    response = entry.response
-    if response is None:
-        return 0
-    return sys.getsizeof(response.stdout) + sys.getsizeof(response.stderr)
+    """Memory held by a request's stored reply and unacknowledged output chunks.
+
+    Once the final reply is stored the job's chunks are released, so a finished
+    request counts only that reply.
+    """
+    size = 0
+    if entry.response is not None:
+        size += sys.getsizeof(entry.response.stdout)
+        size += sys.getsizeof(entry.response.stderr)
+    if entry.job is not None:
+        size += entry.job.held_output_bytes
+    return size
 
 
 class _Expired(NamedTuple):
@@ -60,6 +67,8 @@ def _outcome(entry: _Request) -> int | str:
         return f"could not be started ({entry.error!r})"
     if entry.error is not None:
         return f"was stopped when its input could not be written ({entry.error!r})"
+    if entry.job is not None and entry.job.exited:
+        return "exited, but its final reply was dropped before it was sent"
     return "was cancelled before it started"
 
 
@@ -136,6 +145,10 @@ class WaitController:
 
     async def _poll(self, entry: _Request, request_id: str, ack_seq: int) -> WaitResult:
         async with entry.lock:
+            if entry.finished_at is None and request_id not in self._requests:
+                # dropped under the byte cap while this poll waited: its output
+                # was released, so report it lost rather than complete empty
+                self._get(request_id)
             entry.seen_at = monotonic()
             job = self._job(entry, request_id)
             if entry.response is not None and ack_seq < entry.response.seq:
@@ -147,6 +160,7 @@ class WaitController:
                 entry.finished_at = monotonic()
                 job.retire()
                 await job.cleanup()
+                job.release_output()  # the stored reply is the copy kept for replay
             response = WaitResult(pid=job.pid, result=result)
             self._prune()
             return response
@@ -203,6 +217,7 @@ class WaitController:
                 entry.finished_at = monotonic()
             entry.job.retire()
             await entry.job.cleanup()
+            entry.job.release_output()
             result = KillResult(seq=seq, stdout=stdout, stderr=stderr)
             self._prune()
             return result
@@ -251,13 +266,17 @@ class WaitController:
         """Expire finished requests.
 
         Guarantee: a terminal reply the host has not acknowledged stays
-        replayable for `_TERMINAL_TTL` seconds after the command finished, unless
+        replayable for `_TERMINAL_TTL` seconds after it was first sent, unless
         unacknowledged replies together hold more than `_MAX_RETAINED_BYTES` of
-        output, when the oldest are dropped first. Hosts acknowledge terminal
-        replies on a later start; acknowledged entries hold no output and only
-        stop a late duplicate start, and the oldest beyond
-        `_MAX_ACKNOWLEDGED_ENTRIES` are dropped early. A command that exited but
-        has not been polled for `_TERMINAL_TTL` seconds is dropped too.
+        output, when the oldest are dropped first. A command that exited but
+        whose final reply has not been sent yet (a host polling every long
+        `poll_interval`) has no time limit, like a running command; it counts
+        toward the byte cap with its last reply and unacknowledged output (not
+        output still unread from its pipes, which is bounded per command as
+        for a running one) and is dropped only after every sent reply. Hosts
+        acknowledge terminal replies on a later start; acknowledged entries hold
+        no output and only stop a late duplicate start, and the oldest beyond
+        `_MAX_ACKNOWLEDGED_ENTRIES` are dropped early.
         A dropped request's ID is kept, with how the command ended but without
         output, for `_EXPIRED_ID_TTL` (at most `_MAX_EXPIRED_IDS` of them), so a
         late repeated start or replay of it fails, saying the result was lost
@@ -266,16 +285,17 @@ class WaitController:
         now = monotonic()
         acknowledged: list[tuple[str, _Request]] = []
         unacknowledged: list[tuple[str, _Request]] = []
+        # sent replies oldest first, then exited commands whose reply is unsent
         for key, entry in sorted(
-            self._requests.items(), key=lambda item: item[1].finished_at or 0
+            self._requests.items(),
+            key=lambda item: (
+                item[1].finished_at is None,
+                item[1].finished_at or item[1].seen_at,
+            ),
         ):
             if entry.finished_at is None:
-                if (
-                    entry.job is not None
-                    and entry.job.exited
-                    and now - entry.seen_at >= _TERMINAL_TTL
-                ):
-                    self._evict(key, entry)
+                if entry.job is not None and entry.job.exited:
+                    unacknowledged.append((key, entry))
             elif now - entry.finished_at >= _TERMINAL_TTL:
                 self._evict(key, entry)
             elif entry.acknowledged:

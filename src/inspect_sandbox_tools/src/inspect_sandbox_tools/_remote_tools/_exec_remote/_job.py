@@ -1,6 +1,7 @@
 import asyncio
 import os
 import signal
+import sys
 from asyncio.subprocess import Process as AsyncIOProcess
 from collections.abc import Callable
 from typing import Literal, NamedTuple
@@ -50,6 +51,14 @@ def _leader_handle(process: AsyncIOProcess) -> psutil.Process | None:
         return psutil.Process(process.pid)
     except psutil.NoSuchProcess:
         return None
+
+
+def _clip(text: str) -> str:
+    """At most one poll reply of output, cut at a UTF-8 character boundary."""
+    data = text.encode()
+    if len(data) <= _MAX_POLL_OUTPUT_BYTES:
+        return text
+    return data[:_MAX_POLL_OUTPUT_BYTES].decode(errors="ignore")
 
 
 class Job:
@@ -274,6 +283,14 @@ class Job:
                 task.cancel()
             await asyncio.gather(*readers, return_exceptions=True)
 
+    @property
+    def held_output_bytes(self) -> int:
+        """Memory held by output chunks kept until the host acknowledges them."""
+        return sum(
+            sys.getsizeof(stdout) + sys.getsizeof(stderr)
+            for stdout, stderr in self._acked_buffer.held()
+        )
+
     def release_output(self) -> None:
         """Release replay data while preserving descendant handles for shutdown.
 
@@ -302,8 +319,9 @@ class Job:
         that outlived it may be left running.
 
         With ``drain_terminal`` (the awaitable protocol), a job that already ended
-        is killed too, and the reply holds at most one poll reply of output: the
-        host reads nothing after a kill, so the rest is dropped.
+        is killed too, and the reply holds at most one poll reply of output per
+        stream, output the host has not acknowledged first: the host reads
+        nothing after a kill, so the rest is dropped.
         """
         if self._state != "running" and not drain_terminal:
             self._acked_buffer.push(("", ""))
@@ -337,7 +355,10 @@ class Job:
             stdout, stderr = self._drain_buffers(final=True)
         self._acked_buffer.push((stdout, stderr))
         seq, chunks = self._acked_buffer.collect(ack_seq)
-        return OutputChunk(seq, *self._combine_chunks(chunks))
+        stdout, stderr = self._combine_chunks(chunks)
+        if drain_terminal:
+            stdout, stderr = _clip(stdout), _clip(stderr)
+        return OutputChunk(seq, stdout, stderr)
 
     async def shutdown(self, timeout: int = 30) -> None:
         """Forcefully terminate this server-owned job during server shutdown."""

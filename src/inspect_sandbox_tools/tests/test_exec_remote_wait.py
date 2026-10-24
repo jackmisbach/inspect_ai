@@ -691,36 +691,110 @@ async def test_kill_reply_holds_at_most_one_reply_of_output(
     )
     params.wait_seconds = 0.0
     first = await controller.start(params)
-    job = controller._requests[params.request_id].job
+    entry = controller._requests[params.request_id]
+    job = entry.job
     assert job is not None
     with anyio.fail_after(5):
         while len(first.result.stdout) + job._stdout_buffer.size < 64:
             await anyio.sleep(0.05)
+    # a full reply that never reaches the host, so its kill acknowledges `first`
+    lost = await controller.poll(params.request_id, first.result.seq, 0.0)
+    assert lost.result.stdout == "x" * 8
 
     killed = await controller.kill(params.request_id, first.result.seq)
 
     assert killed.stdout == "x" * 8
     assert job._stdout_buffer.size == 0
+    # the stored kill reply is the only copy of its output
+    assert job.held_output_bytes == 0
+    assert wait_module._retained_bytes(entry) == sys.getsizeof(
+        killed.stdout
+    ) + sys.getsizeof(killed.stderr)
 
 
-async def test_an_exited_request_nobody_polls_expires(
+async def test_an_exited_request_waits_for_a_late_poll(
     controller: WaitController, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """After the host's wait window it polls every `poll_interval`, however long."""
     clock = [0.0]
     monkeypatch.setattr(wait_module, "monotonic", lambda: clock[0])
-    params = _params("sleep 0.2")
+    params = _params("sleep 0.2; printf done")
     params.wait_seconds = 0.0
-    assert (await controller.start(params)).result.state == "running"
+    first = await controller.start(params)
+    assert first.result.state == "running"
     job = controller._requests[params.request_id].job
     assert job is not None
     with anyio.fail_after(5):
         while job._process.returncode is None:
             await anyio.sleep(0.05)
 
-    clock[0] = wait_module._TERMINAL_TTL
+    clock[0] = 10 * wait_module._TERMINAL_TTL
+    controller._prune()
+    final = await controller.poll(params.request_id, first.result.seq, 0.0)
+
+    assert (final.result.state, final.result.stdout) == ("completed", "done")
+
+
+async def test_an_unsent_result_is_dropped_only_after_sent_replies(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent = _params(_python("print('x' * 4096, end='')"))
+    assert (await controller.start(sent)).result.state == "completed"
+    unsent = _params("sleep 0.2; printf done")
+    unsent.wait_seconds = 0.0
+    first = await controller.start(unsent)
+    entry = controller._requests[unsent.request_id]
+    assert entry.job is not None
+    with anyio.fail_after(5):
+        while entry.job._process.returncode is None:
+            await anyio.sleep(0.05)
+
+    # room for the unsent result only
+    retained = wait_module._retained_bytes(entry)
+    monkeypatch.setattr(wait_module, "_MAX_RETAINED_BYTES", retained)
     controller._prune()
 
-    assert params.request_id not in controller._requests
+    assert sent.request_id in controller._expired
+    final = await controller.poll(unsent.request_id, first.result.seq, 0.0)
+    assert (final.result.state, final.result.stdout) == ("completed", "done")
+
+
+async def test_an_unsent_result_over_the_byte_cap_is_reported_lost(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    params = _params("sleep 0.2")
+    params.wait_seconds = 0.0
+    first = await controller.start(params)
+    job = controller._requests[params.request_id].job
+    assert job is not None
+    with anyio.fail_after(5):
+        while job._process.returncode is None:
+            await anyio.sleep(0.05)
+
+    monkeypatch.setattr(wait_module, "_MAX_RETAINED_BYTES", 0)
+    controller._prune()
+
+    with pytest.raises(ToolException, match="exited, but its final reply was dropped"):
+        await controller.poll(params.request_id, first.result.seq, 0.0)
+
+
+async def test_a_poll_waiting_when_its_unsent_result_is_dropped_reports_it_lost(
+    controller: WaitController,
+) -> None:
+    params = _params("printf done; sleep 0.2")
+    params.wait_seconds = 0.0
+    first = await controller.start(params)
+    entry = controller._requests[params.request_id]
+    assert entry.job is not None
+    with anyio.fail_after(5):
+        while entry.job._process.returncode is None:
+            await anyio.sleep(0.05)
+
+    # as if the byte cap dropped it between the poll's lookup and its reply
+    controller._evict(params.request_id, entry)
+
+    with pytest.raises(ToolException, match="exited, but its final reply was dropped"):
+        await controller._poll(entry, params.request_id, first.result.seq)
 
 
 async def test_acknowledged_reply_keeps_only_a_marker(
