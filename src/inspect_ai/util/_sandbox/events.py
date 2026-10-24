@@ -1,6 +1,7 @@
 import contextlib
 import inspect
 import shlex
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Iterator, Literal, Type, Union, overload
 
@@ -31,11 +32,20 @@ class SandboxTimeoutError(TimeoutError):
         """Partial command output captured before the timeout, if available."""
 
 
+_events_off: ContextVar[frozenset["SandboxEnvironmentProxy"]] = ContextVar(
+    "sandbox_events_off", default=frozenset()
+)
+"""Proxies whose events the current task does not log (see `no_events`)."""
+
+
 class SandboxEnvironmentProxy(SandboxEnvironment):
     def __init__(self, sandbox: SandboxEnvironment) -> None:
         super().__init__()
         self._sandbox = sandbox
-        self._events = True
+
+    @property
+    def _events(self) -> bool:
+        return self not in _events_off.get()
 
     @override
     async def exec(
@@ -221,12 +231,13 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
 
     @contextlib.contextmanager
     def no_events(self) -> Iterator[None]:
-        self._events = False
+        """Log no events of this sandbox from this task (and tasks it starts) in the block."""
+        token = _events_off.set(_events_off.get() | {self})
         try:
             with untracked_sandbox_execs():
                 yield
         finally:
-            self._events = True
+            _events_off.reset(token)
 
     @classmethod
     async def sample_cleanup(
