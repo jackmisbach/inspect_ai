@@ -1,6 +1,7 @@
 import contextlib
 import inspect
 import shlex
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Iterator, Literal, Type, Union, overload
 
@@ -35,7 +36,7 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
     def __init__(self, sandbox: SandboxEnvironment) -> None:
         super().__init__()
         self._sandbox = sandbox
-        self._events = True
+        self._events: ContextVar[bool] = ContextVar("sandbox_events", default=True)
 
     @override
     async def exec(
@@ -96,7 +97,7 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
         if timeout_retry is not True:
             options["timeout_retry"] = timeout_retry
 
-        if self._events:
+        if self._events.get():
             transcript()._event(
                 SandboxEvent(
                     timestamp=timestamp,
@@ -153,7 +154,7 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
             raise SandboxTimeoutError(str(ex)) from ex
 
         # yield event
-        if self._events:
+        if self._events.get():
             transcript()._event(
                 SandboxEvent(
                     timestamp=timestamp,
@@ -187,7 +188,7 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
             raise SandboxTimeoutError(str(ex)) from ex
 
         # yield event
-        if self._events:
+        if self._events.get():
             transcript()._event(
                 SandboxEvent(
                     timestamp=timestamp,
@@ -221,12 +222,13 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
 
     @contextlib.contextmanager
     def no_events(self) -> Iterator[None]:
-        self._events = False
+        """Log no sandbox events for this task (and tasks it starts) in the block."""
+        token = self._events.set(False)
         try:
             with untracked_sandbox_execs():
                 yield
         finally:
-            self._events = True
+            self._events.reset(token)
 
     @classmethod
     async def sample_cleanup(

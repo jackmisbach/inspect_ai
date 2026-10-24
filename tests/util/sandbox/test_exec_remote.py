@@ -22,6 +22,7 @@ from inspect_ai.tool._sandbox_tools_utils.sandbox import (
     SandboxInjectionError,
     _inject_container_tools_code,
 )
+from inspect_ai.util._sandbox._cli import SANDBOX_CLI
 from inspect_ai.util._sandbox.docker.docker import DockerSandboxEnvironment
 from inspect_ai.util._sandbox.environment import SandboxDefaultUser
 from inspect_ai.util._sandbox.events import (
@@ -689,6 +690,61 @@ class TestAwaitableMode:
 
         assert result.success is False
         assert result.returncode == -1
+
+
+# ============================================================================
+# Sandbox events while polling
+# ============================================================================
+
+
+class TestPollSandboxEvents:
+    async def test_poll_does_not_hide_another_tasks_sandbox_events(self) -> None:
+        """A poll suppresses its own SandboxEvent, not those of concurrent execs."""
+        sandbox = _mock_sandbox()
+        polling, release = anyio.Event(), anyio.Event()
+
+        async def fake_exec(cmd: list[str], **kwargs: Any) -> ExecResult[str]:
+            if cmd == ["visible"]:
+                response = ""
+            elif json.loads(kwargs["input"])["method"] == "exec_remote_start":
+                response = _start_response()
+            else:
+                polling.set()
+                await release.wait()
+                response = _poll_response(stdout="done")
+            return ExecResult(success=True, returncode=0, stdout=response, stderr="")
+
+        sandbox.exec = AsyncMock(side_effect=fake_exec)
+        proxy = SandboxEnvironmentProxy(sandbox)
+
+        with patch("inspect_ai.log._transcript.transcript") as transcript:
+            async with anyio.create_task_group() as group:
+                group.start_soon(exec_remote_awaitable, proxy, ["cmd"], 5)
+                await polling.wait()
+                await proxy.exec(["visible"])
+                release.set()
+
+        assert [
+            call.args[0].cmd for call in transcript.return_value._event.call_args_list
+        ] == [f"{SANDBOX_CLI} exec", "visible"]
+
+    async def test_nested_no_events_keeps_the_outer_block_suppressed(self) -> None:
+        sandbox = _mock_sandbox()
+        sandbox.exec.return_value = ExecResult(
+            success=True, returncode=0, stdout="", stderr=""
+        )
+        proxy = SandboxEnvironmentProxy(sandbox)
+
+        with patch("inspect_ai.log._transcript.transcript") as transcript:
+            with proxy.no_events():
+                with proxy.no_events():
+                    pass
+                await proxy.exec(["suppressed"])
+            await proxy.exec(["visible"])
+
+        assert [
+            call.args[0].cmd for call in transcript.return_value._event.call_args_list
+        ] == ["visible"]
 
 
 # ============================================================================
