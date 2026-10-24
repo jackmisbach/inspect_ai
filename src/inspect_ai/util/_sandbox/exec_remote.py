@@ -110,11 +110,12 @@ class ExecRemoteCommonOptions:
     poll_interval: float | None = None
     """Interval between poll requests in seconds (at least 5).
 
-    The first polls that find the command still running with no output are
-    followed by shorter waits of 0.25, 0.5, 1 and 2 seconds (`POLL_RAMP_SECONDS`)
-    before this interval applies, so a short command is not left waiting a whole
-    interval. A poll that returns output is followed by another at once, without
-    using up the ramp."""
+    When this is not set, the first polls that find the command still running
+    with no output are followed by shorter waits of 0.25, 0.5, 1 and 2 seconds
+    (`POLL_RAMP_SECONDS`) before the sandbox's default interval applies, so a
+    short command is not left waiting a whole interval. A poll that returns
+    output is followed by another at once, without using up the ramp. When it
+    is set, every such poll is followed by this interval."""
 
     poll_timeout: float | None = None
     """Timeout for individual RPC poll requests in seconds. Defaults to 120 seconds.
@@ -231,8 +232,9 @@ MIN_POLL_INTERVAL = 5
 
 POLL_RAMP_SECONDS = (0.25, 0.5, 1.0, 2.0)
 """Waits after the first polls that find a command still running with no output,
-before the poll interval applies. Output does not restart the ramp, so a command
-that prints often is still polled at the interval once the ramp is used up."""
+before the default poll interval applies (not used when the caller sets
+`poll_interval`). Output does not restart the ramp, so a command that prints
+often is still polled at the interval once the ramp is used up."""
 
 RPC_TIMEOUT = 120
 """Timeout for individual JSON-RPC calls in seconds."""
@@ -301,7 +303,9 @@ class ExecRemoteProcess:
         self._poll_interval = max(
             MIN_POLL_INTERVAL, options.poll_interval or sandbox_default_poll_interval
         )
-        self._poll_ramp = iter(POLL_RAMP_SECONDS)
+        self._poll_ramp = iter(
+            POLL_RAMP_SECONDS if options.poll_interval is None else ()
+        )
         self._pid: int | None = None
         self._last_seq: int = 0
         self._killed = False

@@ -701,18 +701,18 @@ def _running(stdout: str = "", seq: int = 0) -> str:
 
 
 class TestPollRamp:
-    """Idle polls start on a short ramp before the poll interval applies."""
+    """Idle polls start on a short ramp before the default poll interval applies."""
 
     @pytest.mark.parametrize(
         ("options", "interval"),
         [
             (None, 5),
-            (ExecRemoteAwaitableOptions(poll_interval=1), 5),
-            (ExecRemoteAwaitableOptions(poll_interval=12), 12),
+            (ExecRemoteAwaitableOptions(), 5),
+            (ExecRemoteAwaitableOptions(timeout=30), 5),
         ],
-        ids=["default", "below_minimum", "explicit_above_minimum"],
+        ids=["no_options", "default_options", "other_options"],
     )
-    async def test_idle_polls_ramp_up_to_the_poll_interval(
+    async def test_idle_polls_ramp_up_to_the_default_poll_interval(
         self, options: ExecRemoteAwaitableOptions | None, interval: float
     ) -> None:
         sandbox = _make_scripted_sandbox(
@@ -731,6 +731,38 @@ class TestPollRamp:
             (interval,),
             (interval,),
         ]
+
+    @pytest.mark.parametrize(
+        ("poll_interval", "interval"),
+        [(1, 5), (5, 5), (12, 12)],
+        ids=["below_minimum", "minimum", "above_minimum"],
+    )
+    async def test_explicit_poll_interval_skips_the_ramp(
+        self, poll_interval: float, interval: float
+    ) -> None:
+        sandbox = _make_scripted_sandbox(
+            [_start_response(), *[_running()] * 3, _poll_response(stdout="done")]
+        )
+        options = ExecRemoteAwaitableOptions(poll_interval=poll_interval)
+
+        with patch.object(anyio, "sleep", AsyncMock()) as sleep:
+            result = await exec_remote_awaitable(sandbox, ["cmd"], 5, options)
+
+        assert result.stdout == "done"
+        assert [call.args for call in sleep.await_args_list] == [(interval,)] * 3
+
+    async def test_streaming_with_explicit_poll_interval_skips_the_ramp(self) -> None:
+        sandbox = _make_scripted_sandbox(
+            [_start_response(), _running(), _poll_response(stdout="done")]
+        )
+        options = ExecRemoteStreamingOptions(poll_interval=10)
+
+        with patch.object(anyio, "sleep", AsyncMock()) as sleep:
+            proc = await exec_remote_streaming(sandbox, ["cmd"], 5, options)
+            events = [event async for event in proc]
+
+        assert [type(event) for event in events] == [ExecStdout, ExecCompleted]
+        assert [call.args for call in sleep.await_args_list] == [(10,)]
 
     async def test_output_polls_repoll_at_once_without_using_the_ramp(self) -> None:
         sandbox = _make_scripted_sandbox(
