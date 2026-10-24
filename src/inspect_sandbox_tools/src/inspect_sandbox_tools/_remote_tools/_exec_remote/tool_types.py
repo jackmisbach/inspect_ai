@@ -1,6 +1,6 @@
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel
+from pydantic import AfterValidator, BaseModel, Field
 
 from ..._util.user_switch import RunAs
 
@@ -29,6 +29,40 @@ class PollParams(BaseModel):
 
     pid: int
     ack_seq: int
+    model_config = {"extra": "forbid"}
+
+
+MAX_WAIT_SECONDS = 5.0
+
+# Longer waits are clamped, not rejected, so hosts need not know the server's limit.
+WaitSeconds = Annotated[
+    float,
+    Field(ge=0, allow_inf_nan=False),
+    AfterValidator(lambda seconds: min(seconds, MAX_WAIT_SECONDS)),
+]
+
+
+class StartWaitParams(SubmitParams):
+    """Start an awaitable command with a bounded initial completion wait."""
+
+    request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    wait_seconds: WaitSeconds
+
+
+class PollWaitParams(BaseModel):
+    """Wait for output or completion from a previously registered request."""
+
+    request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    ack_seq: int = Field(ge=0)
+    wait_seconds: WaitSeconds
+    model_config = {"extra": "forbid"}
+
+
+class KillWaitParams(BaseModel):
+    """Cancel an awaitable command, including a pending launch."""
+
+    request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    ack_seq: int = Field(ge=0)
     model_config = {"extra": "forbid"}
 
 
@@ -61,6 +95,13 @@ class PollResult(BaseModel):
     seq: int
     stdout: str
     stderr: str
+
+
+class WaitResult(BaseModel):
+    """Process identity and replayable output from an awaitable command."""
+
+    pid: int
+    result: PollResult
 
 
 class OutputResult(BaseModel):

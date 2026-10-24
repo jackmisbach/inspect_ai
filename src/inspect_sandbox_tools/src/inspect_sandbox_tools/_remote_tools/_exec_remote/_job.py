@@ -2,6 +2,7 @@ import asyncio
 import os
 import signal
 from asyncio.subprocess import Process as AsyncIOProcess
+from collections.abc import Callable
 from typing import Literal, NamedTuple
 
 import psutil
@@ -70,6 +71,7 @@ class Job:
         cwd: str | None = None,
         user: str | RunAs | None = None,
         can_switch_user: bool = False,
+        on_create: Callable[["Job"], None] | None = None,
     ) -> "Job":
         """Create and start a new Job for the given command.
 
@@ -86,6 +88,7 @@ class Job:
             cwd: Working directory for command execution.
             user: User to run the command as (requires can_switch_user=True).
             can_switch_user: Whether the server can switch users (running as root).
+            on_create: Register ownership before writing potentially blocking input.
         """
         user = switch_target(user, can_switch_user)
 
@@ -111,15 +114,21 @@ class Job:
 
         job = cls(process)
 
-        # Write initial input if provided
-        if input is not None and process.stdin is not None:
-            process.stdin.write(input.encode("utf-8"))
-            await process.stdin.drain()
+        try:
+            if on_create is not None:
+                on_create(job)
+            # Write initial input if provided
+            if input is not None and process.stdin is not None:
+                process.stdin.write(input.encode("utf-8"))
+                await process.stdin.drain()
 
-        # Close stdin unless caller wants it kept open
-        if not stdin_open and process.stdin is not None:
-            process.stdin.close()
-            await process.stdin.wait_closed()
+            # Close stdin unless caller wants it kept open
+            if not stdin_open and process.stdin is not None:
+                process.stdin.close()
+                await process.stdin.wait_closed()
+        except BaseException:
+            await job.shutdown()
+            raise
 
         return job
 
@@ -135,6 +144,8 @@ class Job:
         self._acked_buffer: AckedChunkBuffer[tuple[str, str]] = AckedChunkBuffer()
         self._known_descendants: list[psutil.Process] = []
         self._retired = False
+        self._changed = asyncio.Event()
+        self._exit_task: asyncio.Task[int] | None = None
         self._readers_deadline: float | None = None
 
         # Start background read tasks
@@ -151,7 +162,7 @@ class Job:
         assert self._process.pid is not None
         return self._process.pid
 
-    async def poll(self, ack_seq: int) -> PollResult:
+    async def poll(self, ack_seq: int, *, terminal_output: bool = False) -> PollResult:
         """Return current state and incremental output, clearing buffers."""
         # Check if process has finished
         if self._state == "running" and self._process.returncode is not None:
@@ -167,14 +178,23 @@ class Job:
             final=False, max_bytes=_MAX_POLL_OUTPUT_BYTES
         )
 
-        buffers_empty = not stdout and not stderr
+        buffers_empty = (
+            self._stdout_buffer.size == 0
+            and self._stderr_buffer.size == 0
+            and self._stdout_task.done()
+            and self._stderr_task.done()
+            if terminal_output
+            else not stdout and not stderr
+        )
         if self._state != "running" and not buffers_empty:
             # Report as running so client keeps polling
             reported_state: Literal["running", "completed", "killed"] = "running"
             reported_exit_code = None
         elif self._state != "running" and buffers_empty:
             # Buffers drained — flush decoder and report terminal state
-            stdout, stderr = self._drain_buffers(final=True)
+            final_stdout, final_stderr = self._drain_buffers(final=True)
+            stdout += final_stdout
+            stderr += final_stderr
             reported_state = self._state
             reported_exit_code = self._exit_code
         else:
@@ -192,6 +212,31 @@ class Job:
             stdout=combined_out,
             stderr=combined_err,
         )
+
+    async def wait_for_update(self, seconds: float) -> None:
+        """Wait for exit, a full reply of output, or the deadline.
+
+        Output alone does not end the wait, so it is coalesced into fewer replies.
+        Does not consume output or delay a concurrent cancellation.
+        """
+        if self._exit_task is None:
+            self._exit_task = asyncio.create_task(self._process.wait())
+            self._exit_task.add_done_callback(lambda _: self._changed.set())
+        deadline = asyncio.get_running_loop().time() + seconds
+        while True:
+            self._changed.clear()
+            if self._state != "running" or self._process.returncode is not None:
+                return
+            if self._buffered() >= _MAX_POLL_OUTPUT_BYTES:
+                return
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return
+            try:
+                # Process.wait() can stay blocked after exit when a child inherits pipes.
+                await asyncio.wait_for(self._changed.wait(), min(remaining, 0.25))
+            except asyncio.TimeoutError:
+                pass
 
     def _buffered(self) -> int:
         return max(self._stdout_buffer.size, self._stderr_buffer.size)
@@ -222,6 +267,12 @@ class Job:
                 task.cancel()
             await asyncio.gather(*readers, return_exceptions=True)
 
+    def release_output(self) -> None:
+        """Release replay data while preserving descendant handles for shutdown."""
+        self._acked_buffer = AckedChunkBuffer()
+        self._stdout_buffer.drain()
+        self._stderr_buffer.drain()
+
     async def kill(self, ack_seq: int, timeout: int = 5) -> OutputChunk:
         """Terminate the process and return any remaining buffered output.
 
@@ -242,6 +293,7 @@ class Job:
             return OutputChunk(seq, *self._combine_chunks(chunks))
 
         self._state = "killed"
+        self._changed.set()
         # Check and signal are not atomic. Likelihood that leader could exit, be
         # reaped and have its PID reused between is unlikely, as the PID space must
         # wrap inside that gap.
@@ -275,7 +327,7 @@ class Job:
             )
         finally:
             self._known_descendants.clear()
-            await self._wait_for_readers()
+            await self.cleanup()
 
     async def _force_kill_group(self, pgid: int, timeout: int) -> None:
         """SIGKILL the group once SIGTERM's grace period has passed.
@@ -399,6 +451,12 @@ class Job:
     async def cleanup(self) -> None:
         """Clean up resources. Called after job is removed from controller."""
         await self._wait_for_readers()
+        if self._exit_task is not None and not self._exit_task.done():
+            self._exit_task.cancel()
+            try:
+                await self._exit_task
+            except asyncio.CancelledError:
+                pass
 
     async def _wait_for_readers(self) -> None:
         """Wait for background read tasks to complete."""
@@ -428,5 +486,8 @@ class Job:
                 if not data:
                     break
                 await buffer.put(data)
+                self._changed.set()
         except asyncio.CancelledError:
             pass
+        finally:
+            self._changed.set()
