@@ -37,6 +37,11 @@ _events_off: ContextVar[frozenset["SandboxEnvironmentProxy"]] = ContextVar(
 )
 """Proxies whose events the current task does not log (see `no_events`)."""
 
+_event_output_off: ContextVar[frozenset["SandboxEnvironmentProxy"]] = ContextVar(
+    "sandbox_event_output_off", default=frozenset()
+)
+"""Proxies whose exec events the current task logs without output."""
+
 
 class SandboxEnvironmentProxy(SandboxEnvironment):
     def __init__(self, sandbox: SandboxEnvironment) -> None:
@@ -119,7 +124,9 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
                         f"{result.stderr}\n\n{result.stdout}"
                         if result.stderr
                         else result.stdout
-                    ),
+                    )
+                    if self not in _event_output_off.get()
+                    else None,
                     completed=datetime.now(timezone.utc),
                 )
             )
@@ -238,6 +245,15 @@ class SandboxEnvironmentProxy(SandboxEnvironment):
                 yield
         finally:
             _events_off.reset(token)
+
+    @contextlib.contextmanager
+    def no_event_output(self) -> Iterator[None]:
+        """Log exec events without their output, for output reported elsewhere."""
+        token = _event_output_off.set(_event_output_off.get() | {self})
+        try:
+            yield
+        finally:
+            _event_output_off.reset(token)
 
     @classmethod
     async def sample_cleanup(

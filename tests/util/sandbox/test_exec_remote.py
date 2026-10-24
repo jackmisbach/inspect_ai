@@ -100,6 +100,9 @@ def _no_events_context() -> Iterator[None]:
 def _mock_sandbox() -> AsyncMock:
     sandbox = AsyncMock()
     sandbox._tools_default_user = None
+    sandbox._exec_remote_wait_supported = False
+    sandbox.no_events = _no_events_context
+    sandbox.no_event_output = _no_events_context
     return sandbox
 
 
@@ -824,6 +827,448 @@ class TestPollSandboxEvents:
 
 
 # ============================================================================
+# Server-side waits (server_wait)
+# ============================================================================
+
+
+def _wait_response(
+    state: str = "completed",
+    stdout: str = "",
+    stderr: str = "",
+    exit_code: int | None = 0,
+    seq: int = 1,
+) -> str:
+    return _rpc(
+        {
+            "pid": 42,
+            "result": {
+                "state": state,
+                "exit_code": exit_code,
+                "seq": seq,
+                "stdout": stdout,
+                "stderr": stderr,
+            },
+        }
+    )
+
+
+_WAIT = ExecRemoteAwaitableOptions(server_wait=True)
+
+
+class TestAwaitableWaitProtocol:
+    async def test_fast_command_returns_output_and_exit_in_one_request(self) -> None:
+        sandbox = _make_scripted_sandbox(
+            [_wait_response(stdout="contents\n", stderr="warning\n", exit_code=7)]
+        )
+        sandbox._exec_remote_wait_supported = None
+
+        result = await exec_remote_awaitable(sandbox, ["cat", "file"], 5, _WAIT)
+
+        assert (result.stdout, result.stderr, result.returncode, result.success) == (
+            "contents\n",
+            "warning\n",
+            7,
+            False,
+        )
+        assert len(sandbox.requests) == 1
+        method, params = sandbox.requests[0]
+        assert method == "exec_remote_start_wait"
+        assert params["command"] == "cat file"
+        assert params["wait_seconds"] == 5.0
+        assert sandbox.exec.call_args.kwargs["concurrency"] is False
+
+    async def test_start_is_the_one_sandbox_event_and_omits_output(self) -> None:
+        """Like exec_remote_start, one event shows the command line; output is not logged twice."""
+        sandbox = _make_scripted_sandbox(
+            [
+                _wait_response(state="running", exit_code=None, stdout="a", seq=1),
+                _wait_response(stdout="b", seq=2),
+            ]
+        )
+        proxy = SandboxEnvironmentProxy(sandbox)
+
+        with patch("inspect_ai.log._transcript.transcript") as transcript:
+            result = await exec_remote_awaitable(proxy, ["cmd", "x y"], 5, _WAIT)
+
+        assert result.stdout == "ab"
+        assert [method for method, _ in sandbox.requests] == [
+            "exec_remote_start_wait",
+            "exec_remote_poll_wait",
+        ]
+        [event] = [
+            call.args[0] for call in transcript.return_value._event.call_args_list
+        ]
+        assert (event.action, event.cmd, event.result, event.output) == (
+            "exec",
+            f"{SANDBOX_CLI} exec",
+            0,
+            None,
+        )
+        request = json.loads(event.input)
+        assert request["method"] == "exec_remote_start_wait"
+        assert request["params"]["command"] == "cmd 'x y'"
+
+    async def test_waiting_polls_do_not_add_a_client_sleep(self) -> None:
+        sandbox = _make_scripted_sandbox(
+            [
+                _wait_response(state="running", exit_code=None, stdout="first", seq=1),
+                _wait_response(state="running", exit_code=None, seq=2),
+                _wait_response(stdout="last", seq=3),
+            ]
+        )
+        sandbox._exec_remote_wait_supported = None
+
+        with patch.object(anyio, "sleep", side_effect=AssertionError("extra sleep")):
+            result = await exec_remote_awaitable(sandbox, ["cmd"], 5, _WAIT)
+
+        assert result.stdout == "firstlast"
+        assert [method for method, _ in sandbox.requests] == [
+            "exec_remote_start_wait",
+            "exec_remote_poll_wait",
+            "exec_remote_poll_wait",
+        ]
+        assert [params["ack_seq"] for _, params in sandbox.requests[1:]] == [1, 2]
+        assert all(params["wait_seconds"] == 5.0 for _, params in sandbox.requests[1:])
+        assert not any(
+            call.kwargs["concurrency"] for call in sandbox.exec.call_args_list
+        )
+
+    async def test_hold_leaves_most_of_the_rpc_timeout_to_the_transport(self) -> None:
+        sandbox = _make_scripted_sandbox([_wait_response()])
+        sandbox._exec_remote_wait_supported = None
+        options = ExecRemoteAwaitableOptions(poll_timeout=8, server_wait=True)
+
+        await exec_remote_awaitable(sandbox, ["cmd"], 5, options)
+
+        assert sandbox.requests[0][1]["wait_seconds"] == 2.0
+        assert sandbox.exec.call_args.kwargs["timeout"] == 8
+
+    async def test_held_waits_are_bounded_by_their_own_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("INSPECT_EXEC_REMOTE_WAIT_CONCURRENCY", "1")
+        sandbox = _mock_sandbox()
+        sandbox._exec_remote_wait_supported = None
+        in_flight: list[object] = []
+        peak = 0
+        entered, release = anyio.Event(), anyio.Event()
+
+        async def fake_exec(*args: Any, **kwargs: Any) -> ExecResult[str]:
+            nonlocal peak
+            token = object()
+            in_flight.append(token)
+            peak = max(peak, len(in_flight))
+            entered.set()
+            await release.wait()
+            in_flight.remove(token)
+            return ExecResult(
+                success=True, returncode=0, stdout=_wait_response(), stderr=""
+            )
+
+        sandbox.exec = AsyncMock(side_effect=fake_exec)
+        async with anyio.create_task_group() as group:
+            for _ in range(2):
+                group.start_soon(exec_remote_awaitable, sandbox, ["cmd"], 5, _WAIT)
+            await entered.wait()
+            await anyio.wait_all_tasks_blocked()
+            release.set()
+
+        assert peak == 1
+        assert sandbox.exec.await_count == 2
+        assert not any(
+            call.kwargs["concurrency"] for call in sandbox.exec.call_args_list
+        )
+
+    async def test_waits_stop_after_the_wait_window(self) -> None:
+        sandbox = _make_scripted_sandbox(
+            [
+                _wait_response(state="running", exit_code=None, seq=1),
+                _wait_response(state="running", exit_code=None, seq=2),
+                _wait_response(stdout="done", seq=3),
+            ]
+        )
+        sandbox._exec_remote_wait_supported = None
+
+        with (
+            patch.object(exec_remote_module, "WAIT_WINDOW_SECONDS", 0.0),
+            patch.object(anyio, "sleep", AsyncMock()) as sleep,
+        ):
+            result = await exec_remote_awaitable(sandbox, ["cmd"], 5, _WAIT)
+
+        assert result.stdout == "done"
+        assert [call.args for call in sleep.await_args_list] == [(5,), (5,)]
+        assert [params["wait_seconds"] for _, params in sandbox.requests] == [
+            5.0,
+            0.0,
+            0.0,
+        ]
+        assert [call.kwargs["concurrency"] for call in sandbox.exec.call_args_list] == [
+            False,
+            True,
+            True,
+        ]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            SandboxTimeoutError("lost reply"),
+            ConnectionError("connection reset"),
+            RuntimeError("Sandbox.exec failure executing exec_remote_start_wait"),
+        ],
+    )
+    async def test_lost_start_reply_is_recovered_by_repeating_the_start(
+        self, error: Exception
+    ) -> None:
+        sandbox = _make_scripted_sandbox([error, _wait_response(stdout="once")])
+        sandbox._exec_remote_wait_supported = None
+
+        result = await exec_remote_awaitable(sandbox, ["cmd"], 5, _WAIT)
+
+        assert result.stdout == "once"
+        assert [method for method, _ in sandbox.requests] == [
+            "exec_remote_start_wait",
+            "exec_remote_start_wait",
+        ]
+        assert sandbox.requests[0][1] == sandbox.requests[1][1]
+
+    async def test_old_server_fallback_is_cached(self) -> None:
+        sandbox = _make_scripted_sandbox(
+            [
+                _rpc_error("Method not found", code=-32601),
+                _start_response(),
+                _poll_response(stdout="old"),
+                _start_response(),
+                _poll_response(stdout="old again"),
+            ]
+        )
+        sandbox._exec_remote_wait_supported = None
+
+        assert (await exec_remote_awaitable(sandbox, ["cmd"], 5, _WAIT)).stdout == "old"
+        assert (
+            await exec_remote_awaitable(sandbox, ["cmd"], 5, _WAIT)
+        ).stdout == "old again"
+        assert [method for method, _ in sandbox.requests] == [
+            "exec_remote_start_wait",
+            "exec_remote_start",
+            "exec_remote_poll",
+            "exec_remote_start",
+            "exec_remote_poll",
+        ]
+
+    async def test_command_error_cannot_trigger_legacy_start(self) -> None:
+        sandbox = _make_scripted_sandbox([_rpc_error("Method not found", code=-32099)])
+        sandbox._exec_remote_wait_supported = None
+
+        with pytest.raises(RuntimeError, match="Method not found"):
+            await exec_remote_awaitable(sandbox, ["cmd"], 5, _WAIT)
+
+        assert [method for method, _ in sandbox.requests] == ["exec_remote_start_wait"]
+
+    async def test_launch_error_is_raised_once_with_the_legacy_text(self) -> None:
+        """The server answered, so the start is neither resent nor killed."""
+        legacy = "FileNotFoundError(2, 'No such file or directory')"
+        sandbox = _make_scripted_sandbox(
+            [_rpc_error(legacy, code=-32098), _kill_response()]
+        )
+        sandbox._exec_remote_wait_supported = None
+
+        with pytest.raises(RuntimeError) as raised:
+            await exec_remote_awaitable(sandbox, ["cmd"], 5, _WAIT)
+
+        assert str(raised.value) == legacy
+        assert [method for method, _ in sandbox.requests] == ["exec_remote_start_wait"]
+
+    async def test_timed_out_start_is_not_resent_without_timeout_retries(
+        self,
+    ) -> None:
+        sandbox = _make_scripted_sandbox(
+            [SandboxTimeoutError("lost reply"), _kill_response()]
+        )
+        sandbox._exec_remote_wait_supported = None
+        options = ExecRemoteAwaitableOptions(poll_timeout_retry=False, server_wait=True)
+
+        with pytest.raises(TimeoutError):
+            await exec_remote_awaitable(sandbox, ["cmd"], 5, options)
+
+        assert [method for method, _ in sandbox.requests] == [
+            "exec_remote_start_wait",
+            "exec_remote_kill_wait",
+        ]
+
+    async def test_start_is_not_resent_after_the_resend_window(self) -> None:
+        sandbox = _make_scripted_sandbox(
+            [ConnectionError("connection reset"), _kill_response()]
+        )
+        sandbox._exec_remote_wait_supported = None
+
+        with (
+            patch.object(exec_remote_module, "START_RESEND_SECONDS", 0.0),
+            pytest.raises(ConnectionError),
+        ):
+            await exec_remote_awaitable(sandbox, ["cmd"], 5, _WAIT)
+
+        assert [method for method, _ in sandbox.requests] == [
+            "exec_remote_start_wait",
+            "exec_remote_kill_wait",
+        ]
+
+    async def test_failed_start_recovery_still_kills_the_owned_request(self) -> None:
+        sandbox = _make_scripted_sandbox(
+            [
+                SandboxTimeoutError("lost start"),
+                RuntimeError("recovery failed"),
+                _kill_response(),
+            ]
+        )
+        sandbox._exec_remote_wait_supported = None
+
+        with pytest.raises(RuntimeError, match="recovery failed"):
+            await exec_remote_awaitable(sandbox, ["cmd"], 5, _WAIT)
+
+        assert [method for method, _ in sandbox.requests] == [
+            "exec_remote_start_wait",
+            "exec_remote_start_wait",
+            "exec_remote_kill_wait",
+        ]
+        assert len({params["request_id"] for _, params in sandbox.requests}) == 1
+
+    async def test_legacy_start_keeps_pid_available_for_cancellation(self) -> None:
+        sandbox = _mock_sandbox()
+        started, release = anyio.Event(), anyio.Event()
+        requests: list[dict[str, Any]] = []
+
+        async def fake_exec(*args: Any, **kwargs: Any) -> ExecResult[str]:
+            request = json.loads(kwargs["input"])
+            requests.append(request)
+            if request["method"] == "exec_remote_start":
+                started.set()
+                await release.wait()
+                response = _start_response()
+            else:
+                assert request["method"] == "exec_remote_kill"
+                response = _kill_response()
+            return ExecResult(success=True, returncode=0, stdout=response, stderr="")
+
+        sandbox.exec = AsyncMock(side_effect=fake_exec)
+        async with anyio.create_task_group() as group:
+            group.start_soon(exec_remote_awaitable, sandbox, ["cmd"], 5, _WAIT)
+            await started.wait()
+            group.cancel_scope.cancel()
+            release.set()
+
+        assert [request["method"] for request in requests] == [
+            "exec_remote_start",
+            "exec_remote_kill",
+        ]
+        assert requests[-1]["params"]["pid"] == 42
+
+    @pytest.mark.parametrize("options", [None, ExecRemoteAwaitableOptions(timeout=30)])
+    async def test_server_waits_are_off_by_default(
+        self, options: ExecRemoteAwaitableOptions | None
+    ) -> None:
+        """A supporting server gets exactly the polling requests sent without waits."""
+        sandbox = _make_scripted_sandbox(
+            [
+                _start_response(),
+                _poll_response(state="running", exit_code=None),
+                _poll_response(stdout="out", seq=1),
+            ]
+        )
+        sandbox._exec_remote_wait_supported = None
+        sandbox._tools_user = "root"
+
+        with patch.object(anyio, "sleep", AsyncMock()) as sleep:
+            result = await exec_remote_awaitable(sandbox, ["cmd", "a b"], 5, options)
+
+        assert result.stdout == "out"
+        assert [call.args for call in sleep.await_args_list] == [(5,)]
+        exec_kwargs = {
+            "env": {"INSPECT_SANDBOX_JSON_RPC_RESPONSE_MAX_BYTES": "10485760"},
+            "timeout": 120,
+            "timeout_retry": True,
+            "user": "root",
+            "concurrency": True,
+        }
+        requests = [
+            ("exec_remote_start", {"command": "cmd 'a b'"}),
+            ("exec_remote_poll", {"pid": 42, "ack_seq": 0}),
+            ("exec_remote_poll", {"pid": 42, "ack_seq": 0}),
+        ]
+        sent = [
+            (call.args, {**call.kwargs, "input": json.loads(call.kwargs["input"])})
+            for call in sandbox.exec.call_args_list
+        ]
+        for _, kwargs in sent:
+            del kwargs["input"]["id"]
+        assert sent == [
+            (
+                ([SANDBOX_CLI, "exec"],),
+                {
+                    **exec_kwargs,
+                    "input": {"jsonrpc": "2.0", "method": method, "params": params},
+                },
+            )
+            for method, params in requests
+        ]
+
+    async def test_cancellation_during_start_kills_by_request_id(self) -> None:
+        sandbox = _mock_sandbox()
+        sandbox._exec_remote_wait_supported = None
+        started = anyio.Event()
+        requests: list[dict[str, Any]] = []
+
+        async def fake_exec(*args: Any, **kwargs: Any) -> ExecResult[str]:
+            request = json.loads(kwargs["input"])
+            requests.append(request)
+            if request["method"] == "exec_remote_start_wait":
+                started.set()
+                await anyio.sleep_forever()
+            assert request["method"] == "exec_remote_kill_wait"
+            return ExecResult(
+                success=True, returncode=0, stdout=_kill_response(), stderr=""
+            )
+
+        sandbox.exec = AsyncMock(side_effect=fake_exec)
+        async with anyio.create_task_group() as group:
+            group.start_soon(exec_remote_awaitable, sandbox, ["cmd"], 5, _WAIT)
+            await started.wait()
+            group.cancel_scope.cancel()
+
+        assert [request["method"] for request in requests] == [
+            "exec_remote_start_wait",
+            "exec_remote_kill_wait",
+        ]
+        assert (
+            requests[0]["params"]["request_id"] == requests[1]["params"]["request_id"]
+        )
+
+    async def test_deadline_includes_initial_wait(self) -> None:
+        sandbox = _mock_sandbox()
+        sandbox._exec_remote_wait_supported = None
+        requests: list[str] = []
+
+        async def fake_exec(*args: Any, **kwargs: Any) -> ExecResult[str]:
+            method = json.loads(kwargs["input"])["method"]
+            requests.append(method)
+            if method == "exec_remote_start_wait":
+                await anyio.sleep_forever()
+            assert method == "exec_remote_kill_wait"
+            return ExecResult(
+                success=True, returncode=0, stdout=_kill_response(), stderr=""
+            )
+
+        sandbox.exec = AsyncMock(side_effect=fake_exec)
+        with pytest.raises(TimeoutError):
+            await exec_remote_awaitable(
+                sandbox,
+                ["cmd"],
+                5,
+                ExecRemoteAwaitableOptions(timeout=0.01, server_wait=True),
+            )
+        assert requests == ["exec_remote_start_wait", "exec_remote_kill_wait"]
+
+
+# ============================================================================
 # Timeout
 # ============================================================================
 
@@ -1493,3 +1938,70 @@ async def test_ack_seq_retransmit(docker_sandbox) -> None:
 
     await proc.close_stdin()
     _ = [event async for event in proc]
+
+
+def _record_methods(fail_first: bool = False) -> tuple[list[str], Any]:
+    """Wrap exec_model_request to record methods, optionally losing the first reply."""
+    from inspect_ai._util._json_rpc import exec_model_request as original
+
+    methods: list[str] = []
+
+    async def record(*args: Any, **kwargs: Any) -> Any:
+        result = await original(*args, **kwargs)
+        methods.append(kwargs["method"])
+        if fail_first and len(methods) == 1:
+            raise ConnectionError("connection dropped after the server replied")
+        return result
+
+    return methods, patch.object(exec_remote_module, "exec_model_request", record)
+
+
+@skip_if_no_docker
+@pytest.mark.slow
+async def test_awaitable_returns_in_one_wait_trip(docker_sandbox) -> None:
+    """Output around a pause and a child's late output return with the exit status."""
+    methods, recording = _record_methods()
+    with recording:
+        result = await exec_remote_awaitable(
+            docker_sandbox,
+            ["sh", "-c", "echo early; sleep 1; (sleep 0.3; echo late) & echo err >&2"],
+            docker_sandbox.default_polling_interval(),
+            _WAIT,
+        )
+
+    assert (result.stdout, result.stderr) == ("early\nlate\n", "err\n")
+    assert methods == ["exec_remote_start_wait"]
+
+
+@skip_if_no_docker
+@pytest.mark.slow
+async def test_lost_start_reply_does_not_launch_twice(docker_sandbox) -> None:
+    """The resent start of a running command reports it instead of launching again."""
+    methods, recording = _record_methods(fail_first=True)
+    with recording:
+        result = await exec_remote_awaitable(
+            docker_sandbox,
+            ["sh", "-c", "echo x >> /tmp/launches; sleep 2; cat /tmp/launches"],
+            docker_sandbox.default_polling_interval(),
+            # holds each request for 1 s, so the first start returns while it runs
+            ExecRemoteAwaitableOptions(poll_timeout=4, server_wait=True),
+        )
+    launches = await docker_sandbox.exec(["cat", "/tmp/launches"])
+
+    assert methods[:2] == ["exec_remote_start_wait", "exec_remote_start_wait"]
+    assert set(methods[2:]) <= {"exec_remote_poll_wait"}
+    assert result.stdout == launches.stdout == "x\n"
+
+
+@skip_if_no_docker
+@pytest.mark.slow
+async def test_awaitable_polls_without_server_wait(docker_sandbox) -> None:
+    methods, recording = _record_methods()
+    with recording:
+        result = await exec_remote_awaitable(
+            docker_sandbox, ["echo", "hi"], docker_sandbox.default_polling_interval()
+        )
+
+    assert result.stdout == "hi\n"
+    assert methods[0] == "exec_remote_start"
+    assert set(methods[1:]) == {"exec_remote_poll"}
