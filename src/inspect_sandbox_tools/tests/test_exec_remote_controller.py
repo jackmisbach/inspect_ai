@@ -195,9 +195,10 @@ async def test_poll_completes_while_a_child_floods_the_pipe(
 
 
 async def test_poll_cancelled_while_readers_settle_keeps_the_job(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A poll cancelled while waiting for the readers leaves the job to the next poll."""
+    monkeypatch.setattr(job_module, "_READER_GRACE_SECONDS", 60.0)
     settling = anyio.Event()
     settle_readers = Job._settle_readers
 
@@ -206,22 +207,35 @@ async def test_poll_cancelled_while_readers_settle_keeps_the_job(
         await settle_readers(job)
 
     monkeypatch.setattr(Job, "_settle_readers", signal_then_settle)
+    release = tmp_path / "release"
+    # the child holds the pipes, and writes, only once the test creates `release`
+    wait_for_release = (
+        f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done"
+    )
     controller = Controller()
-    pid = await controller.submit("(sleep 0.5; printf late) & printf early")
+    pid = await controller.submit(f"({wait_for_release}; printf late) & printf early")
     job = controller._jobs[pid]
+
+    async def poll_until_settling() -> None:
+        while True:  # each poll before the leader exits returns at once
+            await controller.poll(pid, 0)
+            await anyio.sleep(0.01)
+
     try:
-        await job._process.wait()
-        async with anyio.create_task_group() as tasks:
-            tasks.start_soon(controller.poll, pid, 0)
-            await settling.wait()
-            tasks.cancel_scope.cancel()
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(poll_until_settling)
+                await settling.wait()
+                tasks.cancel_scope.cancel()
 
         # the controller still owns the job, and its readers were not stopped
         assert controller._jobs[pid] is job
         assert not job._stdout_task.done()
+        release.touch()
         with anyio.fail_after(5):
             result, stdout = await _poll_until_done(controller, pid)
     finally:
+        release.touch()
         await controller.shutdown()
 
     assert result.state == "completed"
