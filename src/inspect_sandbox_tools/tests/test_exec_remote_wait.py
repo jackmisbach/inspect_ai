@@ -1,6 +1,7 @@
 """Awaitable exec tests own their controller and never start the shared server."""
 
 import shlex
+import shutil
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -401,7 +402,18 @@ async def test_kill_interrupts_initial_input_to_a_nonreading_process(
     assert jobs[0]._process.returncode is not None
 
 
-@pytest.mark.parametrize("setsid", ["", "setsid "])
+@pytest.mark.parametrize(
+    "setsid",
+    [
+        "",
+        pytest.param(
+            "setsid ",
+            marks=pytest.mark.skipif(
+                shutil.which("setsid") is None, reason="needs util-linux setsid"
+            ),
+        ),
+    ],
+)
 async def test_shutdown_ends_a_launch_blocked_by_a_child_holding_stdin(
     controller: WaitController, monkeypatch: pytest.MonkeyPatch, setsid: str
 ) -> None:
