@@ -916,6 +916,38 @@ class TestAwaitableOutputPolls:
         assert len(_polls(sandbox)) == 5
         assert [call.args for call in sleep.await_args_list] == [(w,) for w in waits]
 
+    @pytest.mark.parametrize("stop", ["timeout", "cancel"])
+    async def test_timeout_or_cancellation_in_the_wait_kills_the_command(
+        self, stop: str
+    ) -> None:
+        sandbox = _make_scripted_sandbox([_start_response(), _running("1\n", seq=1)])
+        in_wait = anyio.Event()
+
+        async def wait_until_cancelled(seconds: float) -> None:
+            assert seconds == OUTPUT_REPOLL_SECONDS
+            in_wait.set()
+            await anyio.Event().wait()
+
+        with patch.object(anyio, "sleep", wait_until_cancelled):
+            if stop == "timeout":
+                with pytest.raises(TimeoutError):
+                    await exec_remote_awaitable(
+                        sandbox, ["cmd"], 5, ExecRemoteAwaitableOptions(timeout=0.5)
+                    )
+            else:
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(exec_remote_awaitable, sandbox, ["cmd"], 5)
+                    await in_wait.wait()
+                    tg.cancel_scope.cancel()
+
+        assert in_wait.is_set()
+        assert [method for method, _ in sandbox.requests] == [
+            "exec_remote_start",
+            "exec_remote_poll",
+            "exec_remote_poll",
+            "exec_remote_kill",
+        ]
+
 
 # ============================================================================
 # Timeout
