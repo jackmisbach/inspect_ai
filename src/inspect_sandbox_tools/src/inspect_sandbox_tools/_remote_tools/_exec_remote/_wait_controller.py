@@ -273,7 +273,10 @@ class WaitController:
         `poll_interval`) has no time limit, like a running command; it counts
         toward the byte cap with its last reply and unacknowledged output (not
         output still unread from its pipes, which is bounded per command as
-        for a running one) and is dropped only after every sent reply. Hosts
+        for a running one) and is dropped only after every sent reply, and
+        never while a poll or kill holds its lock to make that reply (which
+        would then report the end of the command without the released
+        output). Hosts
         acknowledge terminal replies on a later start; acknowledged entries hold
         no output and only stop a late duplicate start, and the oldest beyond
         `_MAX_ACKNOWLEDGED_ENTRIES` are dropped early.
@@ -294,7 +297,8 @@ class WaitController:
             ),
         ):
             if entry.finished_at is None:
-                if entry.job is not None and entry.job.exited:
+                job = entry.job
+                if job is not None and job.exited and not entry.lock.locked():
                     unacknowledged.append((key, entry))
             elif now - entry.finished_at >= _TERMINAL_TTL:
                 self._evict(key, entry)

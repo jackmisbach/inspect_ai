@@ -797,6 +797,57 @@ async def test_a_poll_waiting_when_its_unsent_result_is_dropped_reports_it_lost(
         await controller._poll(entry, params.request_id, first.result.seq)
 
 
+async def test_an_unsent_result_is_kept_while_its_poll_settles_the_readers(
+    controller: WaitController, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The byte cap cannot release the output of a reply being made."""
+    monkeypatch.setattr(job_module, "_READER_GRACE_SECONDS", 60.0)
+    settling = anyio.Event()
+    settle_readers = Job._settle_readers
+
+    async def signal_then_settle(job: Job) -> None:
+        settling.set()
+        await settle_readers(job)
+
+    monkeypatch.setattr(Job, "_settle_readers", signal_then_settle)
+    go, release = tmp_path / "go", tmp_path / "release"
+
+    def wait_for(path: Path) -> str:
+        return f"while [ ! -e {shlex.quote(str(path))} ]; do sleep 0.01; done"
+
+    # the leader prints and exits once `go` exists; a child holds the pipes until
+    # `release` exists
+    params = _params(f"{wait_for(go)}; printf done; ({wait_for(release)}) &")
+    params.wait_seconds = 0.0
+    first = await controller.start(params)
+    assert first.result.state == "running"
+    job = controller._requests[params.request_id].job
+    assert job is not None
+    go.touch()
+    with anyio.fail_after(5):
+        while not job.exited or job._stdout_buffer.size == 0:
+            await anyio.sleep(0.05)
+
+    replies: list[WaitResult] = []
+
+    async def poll() -> None:
+        replies.append(await controller.poll(params.request_id, first.result.seq, 0.0))
+
+    try:
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(poll)
+                await settling.wait()
+                # as a start or poll of another request would
+                monkeypatch.setattr(wait_module, "_MAX_RETAINED_BYTES", 0)
+                controller._prune()
+                release.touch()
+    finally:
+        release.touch()
+
+    assert (replies[0].result.state, replies[0].result.stdout) == ("completed", "done")
+
+
 async def test_acknowledged_reply_keeps_only_a_marker(
     controller: WaitController, tmp_path: Path
 ) -> None:
