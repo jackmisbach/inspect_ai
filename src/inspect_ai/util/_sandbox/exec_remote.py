@@ -486,7 +486,6 @@ class ExecRemoteProcess:
                 "wait_seconds": self._wait_seconds,
             }
             if acks:
-                # servers that keep no replies ignore this field
                 request["acks"] = list(acks)
             sandbox_proxy = cast(SandboxEnvironmentProxy, self._transport.sandbox)
             first_sent = time.monotonic()

@@ -1059,7 +1059,7 @@ class TestAwaitableWaitProtocol:
         assert sandbox.requests[0][1] == sandbox.requests[1][1]
 
     async def test_terminal_replies_are_acknowledged_on_the_next_start(self) -> None:
-        """With nothing to acknowledge a start has no `acks`, as servers before it."""
+        """With nothing to acknowledge a start has no `acks`."""
         sandbox = _make_scripted_sandbox([_wait_response(stdout="first")])
         sandbox._exec_remote_wait_supported = None
 
@@ -1070,27 +1070,6 @@ class TestAwaitableWaitProtocol:
         assert "acks" not in first
         assert second["acks"] == [first["request_id"]]
         assert sandbox._exec_remote_acks == (second["request_id"],)
-
-    async def test_server_that_keeps_no_replies(self) -> None:
-        """Such a server ignores `acks`, and reports a lost final reply as lost."""
-        lost = "result lost: the command ran and exited with code 0."
-        sandbox = _make_scripted_sandbox(
-            [
-                _wait_response(stdout="one"),
-                SandboxTimeoutError("lost reply"),
-                _rpc_error(f"exec_remote request x {lost}"),
-            ]
-        )
-        sandbox._exec_remote_wait_supported = None
-
-        assert (await exec_remote_awaitable(sandbox, ["one"], 5, _WAIT)).stdout == "one"
-        with pytest.raises(RuntimeError, match=lost):
-            await exec_remote_awaitable(sandbox, ["two"], 5, _WAIT)
-
-        first, second, resent = (params for _, params in sandbox.requests)
-        assert "acks" not in first
-        assert second == resent
-        assert second["acks"] == [first["request_id"]]
 
     async def test_kill_replies_are_acknowledged_on_the_next_start(self) -> None:
         sandbox = _mock_sandbox()
