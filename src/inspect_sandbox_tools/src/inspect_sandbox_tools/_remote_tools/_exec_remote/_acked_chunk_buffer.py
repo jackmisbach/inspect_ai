@@ -55,3 +55,7 @@ class AckedChunkBuffer(Generic[T]):
         """
         self._held = [(s, c) for s, c in self._held if s > ack_seq]
         return (self._seq, [c for _, c in self._held])
+
+    def clear(self) -> None:
+        """Discard every held chunk; the seq is kept."""
+        self._held.clear()

@@ -199,8 +199,7 @@ class Job:
     async def _settle_readers(self) -> None:
         """After exit, let the readers reach EOF before closing the buffers.
 
-        Output written before exit is therefore never dropped. Readers still
-        running after the grace period (a child holding the pipes) are stopped,
+        Readers still running after the grace period (a child holding the pipes) are stopped,
         even while a full reply is buffered, so completion is always reached;
         what they buffered is still delivered.
         """
@@ -401,12 +400,14 @@ class Job:
     async def cleanup(self) -> None:
         """Clean up resources. Called after job is removed from controller.
 
-        Retired jobs are kept until shutdown and nothing reads their buffers,
-        so output the readers buffer here is dropped.
+        Retired jobs are kept until shutdown and nothing reads their output,
+        so output the readers buffer here, and chunks still held for the host,
+        are dropped.
         """
         await self._wait_for_readers()
         self._stdout_buffer.drain()
         self._stderr_buffer.drain()
+        self._acked_buffer.clear()
 
     async def _wait_for_readers(self) -> None:
         """Wait for background read tasks to complete.

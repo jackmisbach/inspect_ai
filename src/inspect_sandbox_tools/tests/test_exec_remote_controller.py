@@ -264,10 +264,11 @@ async def test_poll_sends_a_full_reply_at_once_and_readers_keep_their_grace(
     assert first.stdout + rest == "\0" * size + "late"
 
 
+@pytest.mark.parametrize("finish", ["poll", "kill"])
 async def test_poll_cancelled_while_readers_settle_keeps_the_job(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, finish: str
 ) -> None:
-    """A poll cancelled while waiting for the readers leaves the job to the next poll."""
+    """A poll cancelled while waiting for the readers leaves the job to the next call."""
     monkeypatch.setattr(job_module, "_READER_GRACE_SECONDS", 60.0)
     settling = anyio.Event()
     settle_readers = Job._settle_readers
@@ -302,12 +303,15 @@ async def test_poll_cancelled_while_readers_settle_keeps_the_job(
         assert not job._stdout_task.done()
         release.touch()
         with anyio.fail_after(5):
-            result, stdout = await _poll_until_done(controller, pid)
+            if finish == "poll":
+                result, stdout = await _poll_until_done(controller, pid)
+                assert result.state == "completed"
+            else:
+                stdout = (await controller.kill(pid, 0)).stdout
     finally:
         release.touch()
         await controller.shutdown()
 
-    assert result.state == "completed"
     assert stdout == "earlylate"
     assert pid not in controller._jobs
     assert job._stdout_task.done() and job._stderr_task.done()
@@ -421,7 +425,9 @@ async def test_kill_returns_output_a_poll_left_after_seeing_the_exit() -> None:
         await controller.shutdown()
 
     assert first.stdout + killed.stdout == "\0" * size
+    # the retired job holds no output until shutdown
     assert job._stdout_buffer.size == 0
+    assert job._acked_buffer.collect(0)[1] == []
 
 
 async def test_cleanup_drops_output_buffered_after_removal() -> None:
