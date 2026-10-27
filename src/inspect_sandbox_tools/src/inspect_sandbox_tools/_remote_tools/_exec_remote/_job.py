@@ -401,7 +401,11 @@ class Job:
         await self._wait_for_readers()
 
     async def _wait_for_readers(self) -> None:
-        """Wait for background read tasks to complete."""
+        """Wait for background read tasks to complete.
+
+        Closing the buffers first frees a reader waiting on a full buffer, as
+        nothing drains them here; output that still fits is kept.
+        """
         self._stdout_buffer.close()
         self._stderr_buffer.close()
         for task in [self._stdout_task, self._stderr_task]:

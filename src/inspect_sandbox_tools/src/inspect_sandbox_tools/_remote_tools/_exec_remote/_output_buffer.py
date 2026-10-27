@@ -29,7 +29,7 @@ class BoundedByteBuffer:
         while len(self._buf) >= self._max_bytes and not self._closed:
             self._has_space.clear()
             await self._has_space.wait()
-        if not self._closed:
+        if len(self._buf) < self._max_bytes:
             self._buf.extend(data)
 
     def drain(self, max_bytes: int | None = None) -> bytes:
@@ -51,7 +51,9 @@ class BoundedByteBuffer:
     def close(self) -> None:
         """Unblock any waiting put() so the reader task can exit.
 
-        Subsequent put() calls are silently discarded.
+        From then on put() never waits: data is still kept while the buffer
+        is under its limit, so a reader can run to EOF with nothing draining
+        the buffer, and discarded once it is full.
         """
         self._closed = True
         self._has_space.set()

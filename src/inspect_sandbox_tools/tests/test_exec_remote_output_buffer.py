@@ -56,12 +56,13 @@ async def test_close_wakes_waiter():
 
 
 @pytest.mark.asyncio
-async def test_put_after_close_is_noop():
-    buf = BoundedByteBuffer(max_bytes=100)
+async def test_put_after_close_keeps_what_fits_without_waiting():
+    buf = BoundedByteBuffer(max_bytes=10)
     await buf.put(b"before")
     buf.close()
-    await buf.put(b"after")
-    assert buf.drain() == b"before"
+    await asyncio.wait_for(buf.put(b"after"), timeout=0.05)  # under the limit: kept
+    await asyncio.wait_for(buf.put(b"more"), timeout=0.05)  # full: discarded
+    assert buf.drain() == b"beforeafter"
 
 
 @pytest.mark.asyncio

@@ -17,7 +17,10 @@ import pytest
 from inspect_sandbox_tools._remote_tools._exec_remote import _job as job_module
 from inspect_sandbox_tools._remote_tools._exec_remote._controller import Controller
 from inspect_sandbox_tools._remote_tools._exec_remote._job import Job
-from inspect_sandbox_tools._remote_tools._exec_remote.tool_types import PollResult
+from inspect_sandbox_tools._remote_tools._exec_remote.tool_types import (
+    KillResult,
+    PollResult,
+)
 from inspect_sandbox_tools._util.common_types import ToolException
 
 
@@ -150,9 +153,11 @@ async def test_retired_job_shutdown_uses_only_its_captured_processes(
     )
 
 
-async def _poll_until_done(controller: Controller, pid: int) -> tuple[PollResult, str]:
+async def _poll_until_done(
+    controller: Controller, pid: int, ack_seq: int = 0
+) -> tuple[PollResult, str]:
     """Poll like the host does, returning the terminal reply and all stdout."""
-    stdout, ack_seq = "", 0
+    stdout = ""
     while True:
         result = await controller.poll(pid, ack_seq)
         assert len(result.stdout) <= job_module._MAX_POLL_OUTPUT_BYTES
@@ -160,6 +165,17 @@ async def _poll_until_done(controller: Controller, pid: int) -> tuple[PollResult
         if result.state != "running":
             return result, stdout
         await anyio.sleep(0.05)  # a host round trip between polls
+
+
+def _wait_for_file(path: Path) -> str:
+    """A shell loop that ends once the test creates `path`."""
+    return f"while [ ! -e {shlex.quote(str(path))} ]; do sleep 0.01; done"
+
+
+async def _wait_for_leader_exit(job: Job) -> None:
+    """Wait for the leader to exit without polling, so no poll has seen the exit."""
+    while job._process.returncode is None:
+        await anyio.sleep(0.01)
 
 
 async def test_poll_keeps_output_a_child_writes_after_the_leader_exits() -> None:
@@ -194,6 +210,60 @@ async def test_poll_completes_while_a_child_floods_the_pipe(
     assert result.exit_code == 3
 
 
+async def test_poll_waits_one_grace_period_for_both_streams() -> None:
+    """The readers share one grace period rather than each waiting for its own."""
+    controller = Controller()
+    pid = await controller.submit("sleep 30 & exit 0")  # the child holds both pipes
+    job = controller._jobs[pid]
+    try:
+        with anyio.fail_after(10):
+            await _wait_for_leader_exit(job)
+            start = anyio.current_time()
+            result, stdout = await _poll_until_done(controller, pid)
+            elapsed = anyio.current_time() - start
+    finally:
+        await controller.shutdown()
+
+    assert result.state == "completed"
+    assert stdout == ""
+    grace = job_module._READER_GRACE_SECONDS
+    assert grace - 0.05 <= elapsed < 1.75 * grace  # one stream after the other: 2x
+
+
+async def test_poll_sends_a_full_reply_at_once_and_readers_keep_their_grace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A full reply buffered at exit is sent without waiting; the readers go on."""
+    monkeypatch.setattr(job_module, "_READER_GRACE_SECONDS", 30.0)
+    full = job_module._MAX_POLL_OUTPUT_BYTES
+    size = 3 * full
+    release = tmp_path / "release"
+    controller = Controller()
+    pid = await controller.submit(
+        f"head -c {size} /dev/zero; ({_wait_for_file(release)}; printf late) & exit 0"
+    )
+    job = controller._jobs[pid]
+    try:
+        with anyio.fail_after(10):  # well inside the grace period
+            await _wait_for_leader_exit(job)
+            while job._buffered() < full:
+                await anyio.sleep(0.01)
+            first = await controller.poll(pid, 0)
+        assert first.state == "running"
+        assert len(first.stdout) == full
+        assert not job._stdout_task.done()  # the readers were not stopped
+
+        release.touch()
+        with anyio.fail_after(10):
+            result, rest = await _poll_until_done(controller, pid, first.seq)
+    finally:
+        release.touch()
+        await controller.shutdown()
+
+    assert result.state == "completed"
+    assert first.stdout + rest == "\0" * size + "late"
+
+
 async def test_poll_cancelled_while_readers_settle_keeps_the_job(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -209,11 +279,10 @@ async def test_poll_cancelled_while_readers_settle_keeps_the_job(
     monkeypatch.setattr(Job, "_settle_readers", signal_then_settle)
     release = tmp_path / "release"
     # the child holds the pipes, and writes, only once the test creates `release`
-    wait_for_release = (
-        f"while [ ! -e {shlex.quote(str(release))} ]; do sleep 0.01; done"
-    )
     controller = Controller()
-    pid = await controller.submit(f"({wait_for_release}; printf late) & printf early")
+    pid = await controller.submit(
+        f"({_wait_for_file(release)}; printf late) & printf early"
+    )
     job = controller._jobs[pid]
 
     async def poll_until_settling() -> None:
@@ -294,6 +363,43 @@ async def test_kill_after_leader_exited_returns_output_without_signalling(
     assert seq == 1
     assert stdout == "done\n"
     assert stderr == ""
+
+
+async def test_kill_keeps_output_a_child_writes_after_the_leader_exits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """kill() after the leader exited, but before a poll saw it, waits for the child."""
+    waiting = anyio.Event()
+    wait_for_readers = Job._wait_for_readers
+
+    async def signal_then_wait(job: Job) -> None:
+        waiting.set()
+        await wait_for_readers(job)
+
+    monkeypatch.setattr(Job, "_wait_for_readers", signal_then_wait)
+    release = tmp_path / "release"
+    controller = Controller()
+    pid = await controller.submit(
+        f"({_wait_for_file(release)}; printf late) & printf early"
+    )
+    job = controller._jobs[pid]
+    killed: list[KillResult] = []
+
+    async def kill() -> None:
+        killed.append(await controller.kill(pid, 0))
+
+    try:
+        with anyio.fail_after(5):
+            await _wait_for_leader_exit(job)
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(kill)
+                await waiting.wait()  # kill() is waiting for the readers
+                release.touch()
+    finally:
+        release.touch()
+        await controller.shutdown()
+
+    assert [result.stdout for result in killed] == ["earlylate"]
 
 
 @pytest.mark.asyncio
