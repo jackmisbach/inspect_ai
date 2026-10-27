@@ -237,7 +237,9 @@ class Job:
         that outlived it may be left running.
         """
         if self._state != "running":
-            self._acked_buffer.push(("", ""))
+            # A poll may have seen the exit without delivering all the output.
+            await self._wait_for_readers()
+            self._acked_buffer.push(self._drain_buffers(final=True))
             seq, chunks = self._acked_buffer.collect(ack_seq)
             return OutputChunk(seq, *self._combine_chunks(chunks))
 
@@ -397,8 +399,14 @@ class Job:
         )
 
     async def cleanup(self) -> None:
-        """Clean up resources. Called after job is removed from controller."""
+        """Clean up resources. Called after job is removed from controller.
+
+        Retired jobs are kept until shutdown and nothing reads their buffers,
+        so output the readers buffer here is dropped.
+        """
         await self._wait_for_readers()
+        self._stdout_buffer.drain()
+        self._stderr_buffer.drain()
 
     async def _wait_for_readers(self) -> None:
         """Wait for background read tasks to complete.

@@ -402,6 +402,39 @@ async def test_kill_keeps_output_a_child_writes_after_the_leader_exits(
     assert [result.stdout for result in killed] == ["earlylate"]
 
 
+async def test_kill_returns_output_a_poll_left_after_seeing_the_exit() -> None:
+    """kill() after a poll saw the exit still returns what that poll left."""
+    full = job_module._MAX_POLL_OUTPUT_BYTES
+    size = 3 * full
+    controller = Controller()
+    pid = await controller.submit(f"head -c {size} /dev/zero")
+    job = controller._jobs[pid]
+    try:
+        with anyio.fail_after(10):
+            await _wait_for_leader_exit(job)
+            while job._buffered() < full:
+                await anyio.sleep(0.01)
+            first = await controller.poll(pid, 0)
+            assert first.state == "running"
+            killed = await controller.kill(pid, first.seq)
+    finally:
+        await controller.shutdown()
+
+    assert first.stdout + killed.stdout == "\0" * size
+    assert job._stdout_buffer.size == 0
+
+
+async def test_cleanup_drops_output_buffered_after_removal() -> None:
+    """A retired job holds no output until shutdown."""
+    job = await Job.create("printf early")
+    await job._process.wait()
+
+    await job.cleanup()
+
+    assert job._stdout_buffer.size == 0
+    assert job._stderr_buffer.size == 0
+
+
 @pytest.mark.asyncio
 async def test_kill_treats_reused_pid_as_exited(
     monkeypatch: pytest.MonkeyPatch,
